@@ -1,0 +1,11 @@
+{
+  "title": "Network Congestion Prediction",
+  "description": "Frontend for Network Congestion Prediction System",
+  "language": "en",
+  "icons": { "icon": "/favicon.ico" },
+  "openGraph": { "image": "/og-image.png" },
+  "analytics": { "googleAnalyticsId": "" },
+  "robots": { "index": true },
+  "customScripts": {},
+  "accessibility": { "addBypassLinks": true }
+}
