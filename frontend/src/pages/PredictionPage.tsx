@@ -1,4 +1,6 @@
 import { useState } from "react";
+import Papa from "papaparse";
+import api from "../api/api";
 import { RadarChart, Radar, PolarGrid, PolarAngleAxis, PolarRadiusAxis, ResponsiveContainer, AreaChart, Area, XAxis, YAxis, CartesianGrid, Tooltip } from "recharts";
 
 const radarData = [
@@ -19,31 +21,79 @@ const parameters = ["Latency", "Bandwidth", "Packet Loss", "Jitter", "Throughput
 
 export default function PredictionPage() {
   const [dragging, setDragging] = useState(false);
-  const [file, setFile] = useState<string | null>(null);
+  const [file, setFile] = useState<File | null>(null);
   const [running, setRunning] = useState(false);
   const [done, setDone] = useState(false);
   const [progress, setProgress] = useState(0);
+  const [prediction, setPrediction] = useState("");
+  const [confidence, setConfidence] = useState(0);
 
   const handleDrop = (e: React.DragEvent) => {
     e.preventDefault();
     setDragging(false);
     const f = e.dataTransfer.files[0];
-    if (f) setFile(f.name);
+    if (f && f.type === "text/csv") setFile(f);
   };
 
-  const handleRun = () => {
+  const handleRun = async () => {
     if (!file) return;
     setRunning(true);
+    setDone(false);
+    setPrediction("");
     setProgress(0);
+
     let p = 0;
-    const id = setInterval(() => {
+    const id = window.setInterval(() => {
       p += Math.random() * 8 + 2;
-      setProgress(Math.min(p, 100));
-      if (p >= 100) {
-        clearInterval(id);
-        setTimeout(() => { setRunning(false); setDone(true); }, 400);
-      }
+      setProgress(Math.min(p, 90));
     }, 120);
+
+    try {
+      // Read and parse the CSV file
+      const fileText = await file.text();
+      const parsed = Papa.parse(fileText, { header: true, dynamicTyping: false });
+      
+      if (!parsed.data || parsed.data.length === 0) {
+        throw new Error("CSV file is empty");
+      }
+
+      // Get the first data row
+      const firstRow = parsed.data[0] as Record<string, string>;
+
+      // Convert CSV row to backend format with proper numeric types
+      const predictionData = {
+        Traffic_Volume_Bytes: Number(firstRow.Traffic_Volume_Bytes),
+        Packets_Per_Second: Number(firstRow.Packets_Per_Second),
+        Packet_Size_Bytes: Number(firstRow.Packet_Size_Bytes),
+        Flow_Duration_ms: Number(firstRow.Flow_Duration_ms),
+        Bandwidth_Utilization_Percent: Number(firstRow.Bandwidth_Utilization_Percent),
+        Throughput_Mbps: Number(firstRow.Throughput_Mbps),
+        Latency_ms: Number(firstRow.Latency_ms),
+        Jitter_ms: Number(firstRow.Jitter_ms),
+        Packet_Loss_Percent: Number(firstRow.Packet_Loss_Percent),
+        Queue_Length: Number(firstRow.Queue_Length),
+        Active_Users: Number(firstRow.Active_Users),
+        CPU_Utilization_Percent: Number(firstRow.CPU_Utilization_Percent),
+        Memory_Utilization_Percent: Number(firstRow.Memory_Utilization_Percent),
+        Link_Capacity_Mbps: Number(firstRow.Link_Capacity_Mbps),
+      };
+
+      const response = await api.post("/predict", predictionData);
+
+      setPrediction(response.data.prediction);
+      setConfidence(response.data.confidence);
+      setProgress(100);
+      setDone(true);
+    } catch (error) {
+      console.error("Prediction request failed", error);
+      setPrediction("Error");
+      setConfidence(0);
+      setDone(true);
+      setProgress(100);
+    } finally {
+      clearInterval(id);
+      setRunning(false);
+    }
   };
 
   return (
@@ -82,7 +132,7 @@ export default function PredictionPage() {
                 type="file"
                 accept=".csv"
                 className="hidden"
-                onChange={(e) => setFile(e.target.files?.[0]?.name ?? null)}
+                onChange={(e) => setFile(e.target.files?.[0] ?? null)}
               />
               {/* 3D upload animation */}
               <div className="flex justify-center mb-4">
@@ -105,7 +155,7 @@ export default function PredictionPage() {
 
               {file ? (
                 <div>
-                  <div className="font-mono text-sm mb-1" style={{ color: "#a78bfa" }}>{file}</div>
+                  <div className="font-mono text-sm mb-1" style={{ color: "#a78bfa" }}>{file.name}</div>
                   <div className="text-xs" style={{ color: "#64748b" }}>File ready for analysis</div>
                 </div>
               ) : (
@@ -201,7 +251,7 @@ export default function PredictionPage() {
                   <div>
                     <div className="font-mono text-xs mb-1" style={{ color: "#64748b" }}>CONGESTION LEVEL</div>
                     <div className="font-display text-4xl font-black text-glow-red" style={{ color: "#f87171" }}>
-                      HIGH 🔴
+                      {prediction}
                     </div>
                   </div>
                   <div
@@ -209,7 +259,7 @@ export default function PredictionPage() {
                     style={{ background: "rgba(248,113,113,0.1)", border: "1px solid rgba(248,113,113,0.3)" }}
                   >
                     <div className="font-mono text-xs mb-1" style={{ color: "#64748b" }}>CONFIDENCE</div>
-                    <div className="font-display text-2xl font-bold" style={{ color: "#f87171" }}>97.5%</div>
+                    <div className="font-display text-2xl font-bold" style={{ color: "#f87171" }}>{confidence.toFixed(2)}%</div>
                   </div>
                 </div>
 

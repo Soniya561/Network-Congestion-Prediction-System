@@ -1,4 +1,5 @@
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import pandas as pd
 import joblib
@@ -8,6 +9,18 @@ app = FastAPI(
     title="Network Congestion Prediction System",
     description="Predict Network Congestion using Random Forest",
     version="1.0"
+)
+
+# Enable CORS
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://localhost:5173",
+        "http://localhost:8443",
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 # Load trained model and label encoder
@@ -62,10 +75,32 @@ def predict(data: NetworkInput):
         "Link_Capacity_Mbps": data.Link_Capacity_Mbps
     }])
 
+    # Debug: Print received data
+    print("\n========== INPUT RECEIVED ==========")
+    print(input_df)
+
+    # Predict class
     prediction = model.predict(input_df)
 
+    # Predict probabilities
+    probabilities = model.predict_proba(input_df)
+
+    # Confidence of predicted class
+    predicted_index = prediction[0]
+    confidence = round(float(probabilities[0][predicted_index]) * 100, 2)
+
+    print("\nRaw Prediction:", prediction)
+    print("Class Probabilities:", probabilities)
+
+    # Decode prediction
     congestion_level = encoder.inverse_transform(prediction)[0]
 
+    print("Congestion Level:", congestion_level)
+    print("Confidence:", confidence, "%")
+    print("====================================\n")
+
+    # Return response
     return {
-        "prediction": congestion_level
+        "prediction": congestion_level,
+        "confidence": confidence
     }
