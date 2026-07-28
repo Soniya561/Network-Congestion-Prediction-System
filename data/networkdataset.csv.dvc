@@ -1,0 +1,5 @@
+outs:
+- md5: 66db81237ac947a7a4e7ab9b684c131f
+  size: 10100478
+  hash: md5
+  path: networkdataset.csv
