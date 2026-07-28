@@ -1,8 +1,9 @@
 import { useState, useEffect, useRef } from "react";
 import {
-  AreaChart, Area, LineChart, Line, XAxis, YAxis, CartesianGrid,
+  AreaChart, Area, XAxis, YAxis, CartesianGrid,
   Tooltip, ResponsiveContainer, Legend
 } from "recharts";
+import api from "../api/api";
 
 const trafficData = [
   { time: "00:00", traffic: 42, predicted: 45, threshold: 80 },
@@ -18,6 +19,24 @@ const trafficData = [
   { time: "20:00", traffic: 65, predicted: 68, threshold: 80 },
   { time: "22:00", traffic: 52, predicted: 55, threshold: 80 },
 ];
+
+interface DashboardData {
+  network_health: number;
+  current_congestion: string;
+  confidence: number;
+  prediction_next: string;
+  connected_devices: number;
+  status: string;
+}
+
+const initialDashboardData: DashboardData = {
+  network_health: 94,
+  current_congestion: "Low",
+  confidence: 98.6,
+  prediction_next: "Possible congestion in 10 min",
+  connected_devices: 2400000,
+  status: "Stable",
+};
 
 interface NodeDef {
   id: string;
@@ -153,11 +172,13 @@ function NetworkMap() {
   );
 }
 
-const statsCards = [
+const statsCards = (
+  data: DashboardData
+) => [
   {
     title: "NETWORK HEALTH",
-    value: "94%",
-    sub: "Stable",
+    value: data.network_health,
+    sub: data.status,
     color: "#34d399",
     icon: "◎",
     ring: true,
@@ -165,8 +186,8 @@ const statsCards = [
   },
   {
     title: "CURRENT CONGESTION",
-    value: "LOW",
-    sub: "Confidence: 98.6%",
+    value: data.current_congestion.toUpperCase(),
+    sub: `Confidence: ${data.confidence}%`,
     color: "#38bdf8",
     icon: "◈",
     ring: false,
@@ -174,16 +195,16 @@ const statsCards = [
   },
   {
     title: "AI PREDICTION",
-    value: "10 min",
-    sub: "Possible congestion",
+    value: data.prediction_next,
+    sub: "AI forecast",
     color: "#fbbf24",
     icon: "⚡",
     ring: false,
-    extra: "Confidence: 96.8%",
+    extra: "Confidence values from model",
   },
   {
     title: "CONNECTED DEVICES",
-    value: "2.4M",
+    value: data.connected_devices >= 1000000 ? `${(data.connected_devices / 1000000).toFixed(1)}M` : `${data.connected_devices}`,
     sub: "Active endpoints",
     color: "#a78bfa",
     icon: "⬡",
@@ -216,11 +237,27 @@ function CircularGauge({ value, color }: { value: number; color: string }) {
 
 export default function DashboardPage() {
   const [time, setTime] = useState(new Date());
+  const [dashboardData, setDashboardData] = useState<DashboardData>(initialDashboardData);
+
+  useEffect(() => {
+    const fetchDashboard = async () => {
+      try {
+        const response = await api.get<DashboardData>("/dashboard");
+        setDashboardData(response.data);
+      } catch (error) {
+        console.error("Unable to load dashboard data", error);
+      }
+    };
+
+    fetchDashboard();
+  }, []);
 
   useEffect(() => {
     const id = setInterval(() => setTime(new Date()), 1000);
     return () => clearInterval(id);
   }, []);
+
+  const cards = statsCards(dashboardData);
 
   return (
     <div className="p-6 space-y-6">
@@ -246,7 +283,7 @@ export default function DashboardPage() {
 
       {/* Stat cards */}
       <div className="grid grid-cols-4 gap-4">
-        {statsCards.map((card, i) => (
+        {cards.map((card, i) => (
           <div
             key={i}
             className="glass rounded-xl p-5 card-hover"
@@ -258,7 +295,7 @@ export default function DashboardPage() {
                   {card.title}
                 </div>
                 {card.ring ? (
-                  <CircularGauge value={parseInt(card.value)} color={card.color} />
+                  <CircularGauge value={parseInt(String(card.value))} color={card.color} />
                 ) : (
                   <div
                     className="font-display text-3xl font-black"

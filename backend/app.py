@@ -11,6 +11,66 @@ app = FastAPI(
     version="1.0"
 )
 
+
+class DashboardResponse(BaseModel):
+    network_health: int
+    current_congestion: str
+    confidence: float
+    prediction_next: str
+    connected_devices: int
+    status: str
+
+
+latest_dashboard_state = DashboardResponse(
+    network_health=94,
+    current_congestion="Low",
+    confidence=98.6,
+    prediction_next="Possible congestion in 10 min",
+    connected_devices=2400000,
+    status="Stable",
+)
+
+
+def build_dashboard_state(congestion_label: str, confidence: float) -> DashboardResponse:
+    label = congestion_label.lower()
+
+    if label == "low":
+        return DashboardResponse(
+            network_health=94,
+            current_congestion="Low",
+            confidence=confidence,
+            prediction_next="Possible congestion in 10 min",
+            connected_devices=2400000,
+            status="Stable",
+        )
+    if label == "medium":
+        return DashboardResponse(
+            network_health=72,
+            current_congestion="Medium",
+            confidence=confidence,
+            prediction_next="Monitor traffic in 5 min",
+            connected_devices=2150000,
+            status="At Risk",
+        )
+    if label == "high":
+        return DashboardResponse(
+            network_health=48,
+            current_congestion="High",
+            confidence=confidence,
+            prediction_next="Congestion imminent",
+            connected_devices=1980000,
+            status="Critical",
+        )
+
+    return DashboardResponse(
+        network_health=86,
+        current_congestion=congestion_label,
+        confidence=confidence,
+        prediction_next="Possible congestion in 10 min",
+        connected_devices=2400000,
+        status="Stable",
+    )
+
 # Enable CORS
 app.add_middleware(
     CORSMiddleware,
@@ -52,6 +112,12 @@ def home():
     return {
         "message": "Network Congestion Prediction API is Running!"
     }
+
+
+# Dashboard API
+@app.get("/dashboard")
+def dashboard():
+    return latest_dashboard_state
 
 
 # Prediction API
@@ -98,6 +164,9 @@ def predict(data: NetworkInput):
     print("Congestion Level:", congestion_level)
     print("Confidence:", confidence, "%")
     print("====================================\n")
+
+    global latest_dashboard_state
+    latest_dashboard_state = build_dashboard_state(congestion_level, confidence)
 
     # Return response
     return {
