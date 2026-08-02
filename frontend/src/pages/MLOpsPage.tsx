@@ -1,34 +1,40 @@
+import { useEffect, useState } from "react";
 import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, AreaChart, Area } from "recharts";
+import api from "../api/api";
 
-const latencyData = Array.from({ length: 20 }, (_, i) => ({
-  t: `T-${20 - i}`,
-  latency: 40 + Math.sin(i * 0.7) * 8 + Math.random() * 4,
-  p99: 55 + Math.sin(i * 0.5) * 6 + Math.random() * 3,
-}));
+const initialLatency = Array.from({ length: 20 }, (_, i) => ({ t: `T-${20 - i}`, latency: 20 + i, p99: 40 + i }));
+const initialDrift = Array.from({ length: 14 }, (_, i) => ({ day: `D-${14 - i}`, drift: 0.01, threshold: 0.05 }));
 
-const driftData = Array.from({ length: 14 }, (_, i) => ({
-  day: `D-${14 - i}`,
-  drift: Math.max(0, 0.02 + Math.sin(i * 0.4) * 0.015 + Math.random() * 0.01),
-  threshold: 0.05,
-}));
-
-const pipeline = [
-  { label: "Data Ingestion", status: "running", color: "#34d399", icon: "⬇", detail: "2.4M records/min" },
-  { label: "Feature Engineering", status: "running", color: "#38bdf8", icon: "⚙", detail: "12 features active" },
-  { label: "Model Inference", status: "running", color: "#a78bfa", icon: "🧠", detail: "XGBoost v1.0" },
-  { label: "Post Processing", status: "running", color: "#34d399", icon: "✓", detail: "Threshold: 0.72" },
-  { label: "Alert Dispatch", status: "running", color: "#fbbf24", icon: "📡", detail: "Kafka → NOC" },
-];
-
-const containers = [
-  { name: "model-server-01", cpu: 34, mem: 58, status: "healthy" },
-  { name: "model-server-02", cpu: 28, mem: 52, status: "healthy" },
-  { name: "feature-eng-01", cpu: 61, mem: 74, status: "warning" },
-  { name: "data-ingest-01", cpu: 22, mem: 41, status: "healthy" },
-  { name: "alert-dispatch-01", cpu: 15, mem: 33, status: "healthy" },
-];
 
 export default function MLOpsPage() {
+  const [pipeline, setPipeline] = useState<any[]>([]);
+  const [latencyData, setLatencyData] = useState<any[]>(initialLatency);
+  const [driftData, setDriftData] = useState<any[]>(initialDrift);
+  const [containers, setContainers] = useState<any[]>([]);
+  const [cluster, setCluster] = useState<any>({ pods: 0, nodes: 0, restarts: 0, status: "UNKNOWN" });
+  const [kpis, setKpis] = useState<any>({ model_version: "-", deployment: "-", pred_latency_ms: "-", data_drift: "-", model_health: "-" });
+
+  useEffect(() => {
+    const load = async () => {
+      try {
+        const r = await api.get("/mlops");
+        const d = r.data;
+        setPipeline(d.pipeline || []);
+        setLatencyData(d.latency_data || initialLatency);
+        setDriftData(d.drift_data || initialDrift);
+        setContainers(d.containers || []);
+        setCluster(d.cluster || { pods: 0, nodes: 0, restarts: 0, status: "UNKNOWN" });
+        setKpis({ model_version: d.model_version, deployment: d.deployment, pred_latency_ms: d.pred_latency_ms, data_drift: d.data_drift, model_health: "-" });
+      } catch (e) {
+        console.error("Unable to load mlops data", e);
+      }
+    };
+
+    load();
+    const id = setInterval(load, 10000);
+    return () => clearInterval(id);
+  }, []);
+
   return (
     <div className="p-6 space-y-6">
       <div>
@@ -43,11 +49,11 @@ export default function MLOpsPage() {
       {/* Top KPIs */}
       <div className="grid grid-cols-5 gap-4">
         {[
-          { label: "MODEL VERSION", value: "XGBoost v1.0", color: "#a78bfa", icon: "🤖" },
-          { label: "DEPLOYMENT", value: "Production", color: "#34d399", icon: "🚀" },
-          { label: "PRED LATENCY", value: "45 ms", color: "#38bdf8", icon: "⚡" },
-          { label: "DATA DRIFT", value: "Normal", color: "#34d399", icon: "📊" },
-          { label: "MODEL HEALTH", value: "98%", color: "#34d399", icon: "❤️" },
+          { label: "MODEL VERSION", value: kpis.model_version, color: "#a78bfa", icon: "🤖" },
+          { label: "DEPLOYMENT", value: kpis.deployment, color: "#34d399", icon: "🚀" },
+          { label: "PRED LATENCY", value: `${kpis.pred_latency_ms} ms`, color: "#38bdf8", icon: "⚡" },
+          { label: "DATA DRIFT", value: kpis.data_drift, color: "#34d399", icon: "📊" },
+          { label: "MODEL HEALTH", value: kpis.model_health, color: "#34d399", icon: "❤️" },
         ].map((k) => (
           <div
             key={k.label}

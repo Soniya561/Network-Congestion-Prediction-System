@@ -4,30 +4,7 @@ import {
   Tooltip, ResponsiveContainer, Legend
 } from "recharts";
 import api from "../api/api";
-
-const trafficData = [
-  { time: "00:00", traffic: 42, predicted: 45, threshold: 80 },
-  { time: "02:00", traffic: 38, predicted: 40, threshold: 80 },
-  { time: "04:00", traffic: 31, predicted: 33, threshold: 80 },
-  { time: "06:00", traffic: 55, predicted: 58, threshold: 80 },
-  { time: "08:00", traffic: 72, predicted: 75, threshold: 80 },
-  { time: "10:00", traffic: 68, predicted: 70, threshold: 80 },
-  { time: "12:00", traffic: 85, predicted: 88, threshold: 80 },
-  { time: "14:00", traffic: 78, predicted: 82, threshold: 80 },
-  { time: "16:00", traffic: 92, predicted: 95, threshold: 80 },
-  { time: "18:00", traffic: 88, predicted: 91, threshold: 80 },
-  { time: "20:00", traffic: 65, predicted: 68, threshold: 80 },
-  { time: "22:00", traffic: 52, predicted: 55, threshold: 80 },
-];
-
-interface DashboardData {
-  network_health: number;
-  current_congestion: string;
-  confidence: number;
-  prediction_next: string;
-  connected_devices: number;
-  status: string;
-}
+import { buildDashboardSnapshot, type DashboardData, type TopologyNode, type TrafficPoint } from "../utils/dashboardState";
 
 const initialDashboardData: DashboardData = {
   network_health: 94,
@@ -36,33 +13,42 @@ const initialDashboardData: DashboardData = {
   prediction_next: "Possible congestion in 10 min",
   connected_devices: 2400000,
   status: "Stable",
+  topology_nodes: [
+    { id: "dc1", x: 200, y: 150, type: "datacenter", status: "healthy", label: "DC Mumbai" },
+    { id: "dc2", x: 550, y: 100, type: "datacenter", status: "healthy", label: "DC Chennai" },
+    { id: "dc3", x: 380, y: 280, type: "cloud", status: "healthy", label: "AWS Asia" },
+    { id: "r1", x: 140, y: 250, type: "router", status: "healthy", label: "Edge-01" },
+    { id: "r2", x: 460, y: 200, type: "router", status: "healthy", label: "Core-07" },
+    { id: "r3", x: 300, y: 160, type: "router", status: "healthy", label: "Transit-03" },
+    { id: "c1", x: 620, y: 240, type: "cloud", status: "healthy", label: "Azure East" },
+    { id: "d1", x: 80, y: 320, type: "device", status: "healthy", label: "IoT-Cluster" },
+    { id: "d2", x: 540, y: 320, type: "device", status: "healthy", label: "CDN-Node" },
+  ],
+  edges: [
+    ["dc1", "r3"], ["dc2", "r2"], ["r3", "r2"], ["r3", "dc3"], ["r2", "dc3"],
+    ["r1", "dc1"], ["d1", "r1"], ["dc3", "r2"], ["r2", "c1"], ["c1", "d2"],
+  ],
+  traffic_data: [
+    { time: "00:00", traffic: 42, predicted: 45, threshold: 80 },
+    { time: "02:00", traffic: 38, predicted: 40, threshold: 80 },
+    { time: "04:00", traffic: 31, predicted: 33, threshold: 80 },
+    { time: "06:00", traffic: 55, predicted: 58, threshold: 80 },
+    { time: "08:00", traffic: 72, predicted: 75, threshold: 80 },
+    { time: "10:00", traffic: 68, predicted: 70, threshold: 80 },
+    { time: "12:00", traffic: 85, predicted: 88, threshold: 80 },
+    { time: "14:00", traffic: 78, predicted: 82, threshold: 80 },
+    { time: "16:00", traffic: 92, predicted: 95, threshold: 80 },
+    { time: "18:00", traffic: 88, predicted: 91, threshold: 80 },
+    { time: "20:00", traffic: 65, predicted: 68, threshold: 80 },
+    { time: "22:00", traffic: 52, predicted: 55, threshold: 80 },
+  ],
+  metrics: {
+    total_bandwidth: "0.9 Gbps",
+    avg_latency: "12.4 ms",
+    packet_loss: "0.02%",
+    uptime: "99.97%",
+  },
 };
-
-interface NodeDef {
-  id: string;
-  x: number;
-  y: number;
-  type: "datacenter" | "router" | "cloud" | "device";
-  status: "healthy" | "warning" | "congested" | "predicted";
-  label: string;
-}
-
-const networkNodes: NodeDef[] = [
-  { id: "dc1", x: 200, y: 150, type: "datacenter", status: "healthy", label: "DC Mumbai" },
-  { id: "dc2", x: 550, y: 100, type: "datacenter", status: "congested", label: "DC Chennai" },
-  { id: "dc3", x: 380, y: 280, type: "cloud", status: "healthy", label: "AWS Asia" },
-  { id: "r1", x: 140, y: 250, type: "router", status: "warning", label: "Edge-01" },
-  { id: "r2", x: 460, y: 200, type: "router", status: "healthy", label: "Core-07" },
-  { id: "r3", x: 300, y: 160, type: "router", status: "predicted", label: "Transit-03" },
-  { id: "c1", x: 620, y: 240, type: "cloud", status: "healthy", label: "Azure East" },
-  { id: "d1", x: 80, y: 320, type: "device", status: "healthy", label: "IoT-Cluster" },
-  { id: "d2", x: 540, y: 320, type: "device", status: "warning", label: "CDN-Node" },
-];
-
-const edges = [
-  ["dc1", "r3"], ["dc2", "r2"], ["r3", "r2"], ["r3", "dc3"], ["r2", "dc3"],
-  ["r1", "dc1"], ["d1", "r1"], ["dc3", "r2"], ["r2", "c1"], ["c1", "d2"],
-];
 
 const statusColor: Record<string, string> = {
   healthy: "#34d399",
@@ -71,13 +57,17 @@ const statusColor: Record<string, string> = {
   predicted: "#38bdf8",
 };
 
-function NetworkMap() {
+function NetworkMap({ nodes, edges }: { nodes: TopologyNode[]; edges: string[][] }) {
   const [packets, setPackets] = useState<{ id: number; fromNode: string; toNode: string; t: number }[]>([]);
   const idRef = useRef(0);
+  const edgesRef = useRef(edges);
+  edgesRef.current = edges;
 
   useEffect(() => {
     const id = setInterval(() => {
-      const edge = edges[Math.floor(Math.random() * edges.length)];
+      const currentEdges = edgesRef.current;
+      if (currentEdges.length === 0) return;
+      const edge = currentEdges[Math.floor(Math.random() * currentEdges.length)];
       const reverse = Math.random() > 0.5;
       setPackets((prev) => [
         ...prev.filter((p) => p.t < 1),
@@ -97,12 +87,12 @@ function NetworkMap() {
     return () => cancelAnimationFrame(raf);
   }, []);
 
-  const nodeById = Object.fromEntries(networkNodes.map((n) => [n.id, n]));
+  const nodeById = Object.fromEntries(nodes.map((n) => [n.id, n]));
 
   return (
     <svg width="700" height="400" className="w-full h-full" viewBox="0 0 700 400">
       <defs>
-        {networkNodes.map((n) => (
+        {nodes.map((n) => (
           <radialGradient key={n.id} id={`glow-${n.id}`}>
             <stop offset="0%" stopColor={statusColor[n.status]} stopOpacity="0.4" />
             <stop offset="100%" stopColor={statusColor[n.status]} stopOpacity="0" />
@@ -150,7 +140,7 @@ function NetworkMap() {
       })}
 
       {/* Nodes */}
-      {networkNodes.map((n) => (
+      {nodes.map((n) => (
         <g key={n.id}>
           <circle cx={n.x} cy={n.y} r="20" fill={`url(#glow-${n.id})`} />
           <circle
@@ -238,9 +228,14 @@ function CircularGauge({ value, color }: { value: number; color: string }) {
 export default function DashboardPage() {
   const [time, setTime] = useState(new Date());
   const [dashboardData, setDashboardData] = useState<DashboardData>(initialDashboardData);
+  const hasPredictionSnapshotRef = useRef(false);
 
   useEffect(() => {
     const fetchDashboard = async () => {
+      if (hasPredictionSnapshotRef.current) {
+        return;
+      }
+
       try {
         const response = await api.get<DashboardData>("/dashboard");
         setDashboardData(response.data);
@@ -249,7 +244,22 @@ export default function DashboardPage() {
       }
     };
 
+    const handleSnapshot = (event: Event) => {
+      const detail = (event as CustomEvent<DashboardData>).detail;
+      if (detail) {
+        hasPredictionSnapshotRef.current = true;
+        setDashboardData(detail);
+      }
+    };
+
     fetchDashboard();
+    window.addEventListener("network-dashboard-update", handleSnapshot as EventListener);
+    // Poll every 5 seconds so the dashboard stays live
+    const id = setInterval(fetchDashboard, 5000);
+    return () => {
+      clearInterval(id);
+      window.removeEventListener("network-dashboard-update", handleSnapshot as EventListener);
+    };
   }, []);
 
   useEffect(() => {
@@ -258,6 +268,14 @@ export default function DashboardPage() {
   }, []);
 
   const cards = statsCards(dashboardData);
+  const metrics = dashboardData.metrics;
+
+  const bottomStats = [
+    { label: "TOTAL BANDWIDTH", value: metrics.total_bandwidth, color: "#38bdf8" },
+    { label: "AVG LATENCY", value: metrics.avg_latency, color: "#34d399" },
+    { label: "PACKET LOSS", value: metrics.packet_loss, color: "#34d399" },
+    { label: "UPTIME", value: metrics.uptime, color: "#a78bfa" },
+  ];
 
   return (
     <div className="p-6 space-y-6">
@@ -349,7 +367,7 @@ export default function DashboardPage() {
             </div>
           </div>
           <div className="h-full">
-            <NetworkMap />
+            <NetworkMap nodes={dashboardData.topology_nodes} edges={dashboardData.edges} />
           </div>
         </div>
 
@@ -362,7 +380,7 @@ export default function DashboardPage() {
             <p className="text-xs" style={{ color: "#64748b" }}>24-hour bandwidth utilization vs AI prediction</p>
           </div>
           <ResponsiveContainer width="100%" height={320}>
-            <AreaChart data={trafficData}>
+            <AreaChart data={dashboardData.traffic_data}>
               <defs>
                 <linearGradient id="trafficGrad" x1="0" y1="0" x2="0" y2="1">
                   <stop offset="5%" stopColor="#38bdf8" stopOpacity={0.3} />
@@ -392,12 +410,7 @@ export default function DashboardPage() {
       {/* Bottom status bar */}
       <div className="glass rounded-xl p-4 flex items-center justify-between">
         <div className="flex gap-8">
-          {[
-            { label: "TOTAL BANDWIDTH", value: "847 Gbps", color: "#38bdf8" },
-            { label: "AVG LATENCY", value: "12.4 ms", color: "#34d399" },
-            { label: "PACKET LOSS", value: "0.02%", color: "#34d399" },
-            { label: "UPTIME", value: "99.97%", color: "#a78bfa" },
-          ].map((s) => (
+          {bottomStats.map((s) => (
             <div key={s.label}>
               <div className="font-mono text-xs mb-0.5" style={{ color: "#475569", letterSpacing: "0.08em" }}>{s.label}</div>
               <div className="font-display text-base font-bold" style={{ color: s.color }}>{s.value}</div>

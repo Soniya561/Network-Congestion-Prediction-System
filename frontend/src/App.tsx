@@ -23,7 +23,7 @@ export default function App() {
     switch (currentPage) {
       case "dashboard": return <DashboardPage />;
       case "prediction": return <PredictionPage />;
-      case "analyst": return <AnalystPage />;
+      case "analyst": return <AnalystPage onNavigate={setCurrentPage} />;
       case "analytics": return <MLModelsPage />;
       case "mlops": return <MLOpsPage />;
       case "alerts": return <AlertsPage />;

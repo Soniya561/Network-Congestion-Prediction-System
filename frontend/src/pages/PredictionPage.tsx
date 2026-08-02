@@ -2,6 +2,7 @@ import { useState } from "react";
 import Papa from "papaparse";
 import api from "../api/api";
 import { RadarChart, Radar, PolarGrid, PolarAngleAxis, PolarRadiusAxis, ResponsiveContainer, AreaChart, Area, XAxis, YAxis, CartesianGrid, Tooltip } from "recharts";
+import { buildDashboardSnapshot } from "../utils/dashboardState";
 
 const radarData = [
   { subject: "Latency", A: 85, fullMark: 100 },
@@ -79,7 +80,9 @@ export default function PredictionPage() {
       };
 
       const response = await api.post("/predict", predictionData);
+      const dashboardSnapshot = buildDashboardSnapshot(predictionData, response.data.prediction, response.data.confidence);
 
+      window.dispatchEvent(new CustomEvent("network-dashboard-update", { detail: dashboardSnapshot }));
       setPrediction(response.data.prediction);
       setConfidence(response.data.confidence);
       setProgress(100);

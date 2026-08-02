@@ -1,60 +1,112 @@
+import { useEffect, useMemo, useState } from "react";
 import { RadarChart, Radar, PolarGrid, PolarAngleAxis, ResponsiveContainer, BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, Cell } from "recharts";
+import api from "../api/api";
 
-const models = [
-  {
-    name: "Random Forest",
-    accuracy: 96.8,
-    precision: 95.2,
-    recall: 97.1,
-    f1: 96.1,
-    trainTime: "2.4s",
-    color: "#38bdf8",
-    best: false,
-  },
-  {
-    name: "LightGBM",
-    accuracy: 97.9,
-    precision: 97.4,
-    recall: 98.2,
-    f1: 97.8,
-    trainTime: "0.9s",
-    color: "#34d399",
-    best: false,
-  },
-  {
-    name: "XGBoost",
-    accuracy: 98.4,
-    precision: 98.1,
-    recall: 98.7,
-    f1: 98.4,
-    trainTime: "1.8s",
-    color: "#a78bfa",
-    best: true,
-  },
-];
+interface AnalyticsMetrics {
+  model_name: string;
+  accuracy: number;
+  precision: number;
+  recall: number;
+  f1_score: number;
+  classes: string[];
+  confusion_matrix: Array<{ label: string; value: number; color: string; desc: string }>;
+  radar_metrics: Array<{ metric: string; value: number }>;
+}
 
-const confusionData = [
-  { label: "TP", value: 1842, color: "#34d399", desc: "True Positive" },
-  { label: "TN", value: 2103, color: "#38bdf8", desc: "True Negative" },
-  { label: "FP", value: 29, color: "#fbbf24", desc: "False Positive" },
-  { label: "FN", value: 26, color: "#f87171", desc: "False Negative" },
-];
-
-const radarData = [
-  { metric: "Accuracy", RF: 96.8, XGB: 98.4, LGBM: 97.9 },
-  { metric: "Precision", RF: 95.2, XGB: 98.1, LGBM: 97.4 },
-  { metric: "Recall", RF: 97.1, XGB: 98.7, LGBM: 98.2 },
-  { metric: "F1", RF: 96.1, XGB: 98.4, LGBM: 97.8 },
-  { metric: "Speed", RF: 70, XGB: 85, LGBM: 95 },
-];
-
-const barData = models.map((m) => ({
-  name: m.name.replace(" ", "\n"),
-  Accuracy: m.accuracy,
-  F1: m.f1,
-}));
+const initialAnalytics: AnalyticsMetrics = {
+  model_name: "Random Forest",
+  accuracy: 96.8,
+  precision: 95.2,
+  recall: 97.1,
+  f1_score: 96.1,
+  classes: ["Low", "Medium", "High"],
+  confusion_matrix: [
+    { label: "Low", value: 1842, color: "#34d399", desc: "Correctly predicted Low" },
+    { label: "Medium", value: 2103, color: "#38bdf8", desc: "Correctly predicted Medium" },
+    { label: "High", value: 2001, color: "#a78bfa", desc: "Correctly predicted High" },
+  ],
+  radar_metrics: [
+    { metric: "Accuracy", value: 96.8 },
+    { metric: "Precision", value: 95.2 },
+    { metric: "Recall", value: 97.1 },
+    { metric: "F1", value: 96.1 },
+    { metric: "Stability", value: 97.9 },
+  ],
+};
 
 export default function MLModelsPage() {
+  const [analytics, setAnalytics] = useState<AnalyticsMetrics>(initialAnalytics);
+  const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState<string | null>(null);
+
+  useEffect(() => {
+    const loadAnalytics = async () => {
+      setLoadError(null);
+      setLoading(true);
+
+      try {
+        const response = await api.get<AnalyticsMetrics>("/analytics");
+        setAnalytics(response.data);
+      } catch (error) {
+        console.error("Unable to load analytics data", error);
+        setLoadError("Unable to load the trained model performance metrics right now.");
+      } finally {
+        setLoading(false);
+      }
+    };
+
+    loadAnalytics();
+    const intervalId = setInterval(loadAnalytics, 10000);
+    return () => clearInterval(intervalId);
+  }, []);
+
+  const staticModels = [
+    {
+      name: "LightGBM",
+      accuracy: 97.9,
+      precision: 97.4,
+      recall: 98.2,
+      f1: 97.8,
+      trainTime: "0.9s",
+      color: "#34d399",
+      best: false,
+    },
+    {
+      name: "XGBoost",
+      accuracy: 98.4,
+      precision: 98.1,
+      recall: 98.7,
+      f1: 98.4,
+      trainTime: "1.8s",
+      color: "#a78bfa",
+      best: false,
+    },
+  ];
+
+  const modelCards = useMemo(
+    () => [
+      {
+        name: analytics.model_name,
+        accuracy: analytics.accuracy,
+        precision: analytics.precision,
+        recall: analytics.recall,
+        f1: analytics.f1_score,
+        trainTime: "Live",
+        color: "#38bdf8",
+        best: true,
+      },
+      ...staticModels,
+    ],
+    [analytics],
+  );
+
+  const radarData = useMemo(() => analytics.radar_metrics, [analytics.radar_metrics]);
+  const barData = useMemo(
+    () => modelCards.map((m) => ({ name: m.name.replace(" ", "\n"), Accuracy: m.accuracy, F1: m.f1 })),
+    [modelCards],
+  );
+
+  const confusionData = analytics.confusion_matrix;
   return (
     <div className="p-6 space-y-6">
       <div>
@@ -62,13 +114,25 @@ export default function MLModelsPage() {
           ML MODEL PERFORMANCE
         </h1>
         <p className="text-sm mt-1" style={{ color: "#64748b" }}>
-          AI model comparison — accuracy, precision, recall, and deployment metrics
+          Live metrics from your trained network congestion model and dataset
         </p>
       </div>
 
+      {loading && (
+        <div className="rounded-xl p-4 border border-blue-500/20 bg-blue-500/10 text-blue-100">
+          Loading live analytics from the backend...
+        </div>
+      )}
+
+      {loadError && (
+        <div className="rounded-xl p-4 border border-red-500/20 bg-red-500/10 text-red-100">
+          {loadError}
+        </div>
+      )}
+
       {/* Model cards */}
       <div className="grid grid-cols-3 gap-5">
-        {models.map((m) => (
+        {modelCards.map((m) => (
           <div
             key={m.name}
             className="glass rounded-xl p-5 card-hover relative overflow-hidden"
@@ -138,25 +202,15 @@ export default function MLModelsPage() {
         {/* Radar comparison */}
         <div className="glass rounded-xl p-5">
           <div className="font-display text-xs font-bold mb-3" style={{ color: "#94a3b8", letterSpacing: "0.1em" }}>
-            MULTI-METRIC COMPARISON
+            LIVE MODEL METRICS
           </div>
           <ResponsiveContainer width="100%" height={220}>
             <RadarChart data={radarData}>
               <PolarGrid stroke="rgba(56,189,248,0.1)" />
               <PolarAngleAxis dataKey="metric" tick={{ fill: "#64748b", fontSize: 9, fontFamily: "JetBrains Mono" }} />
-              <Radar name="Random Forest" dataKey="RF" stroke="#38bdf8" fill="#38bdf8" fillOpacity={0.1} strokeWidth={2} />
-              <Radar name="XGBoost" dataKey="XGB" stroke="#a78bfa" fill="#a78bfa" fillOpacity={0.15} strokeWidth={2} />
-              <Radar name="LightGBM" dataKey="LGBM" stroke="#34d399" fill="#34d399" fillOpacity={0.1} strokeWidth={2} />
+              <Radar name={analytics.model_name} dataKey="value" stroke="#38bdf8" fill="#38bdf8" fillOpacity={0.1} strokeWidth={2} />
             </RadarChart>
           </ResponsiveContainer>
-          <div className="flex justify-center gap-4 mt-2">
-            {[["#38bdf8", "RF"], ["#a78bfa", "XGB"], ["#34d399", "LGBM"]].map(([c, l]) => (
-              <div key={l} className="flex items-center gap-1.5">
-                <div className="w-2 h-2 rounded-full" style={{ background: c }} />
-                <span className="font-mono text-xs" style={{ color: "#64748b" }}>{l}</span>
-              </div>
-            ))}
-          </div>
         </div>
 
         {/* Bar chart */}
@@ -171,10 +225,14 @@ export default function MLModelsPage() {
               <YAxis domain={[94, 100]} tick={{ fill: "#64748b", fontSize: 9 }} />
               <Tooltip contentStyle={{ background: "rgba(15,23,42,0.95)", border: "1px solid rgba(56,189,248,0.3)", borderRadius: "8px", fontFamily: "JetBrains Mono", fontSize: "11px" }} />
               <Bar dataKey="Accuracy" radius={[4, 4, 0, 0]}>
-                {barData.map((_, i) => <Cell key={i} fill={models[i].color} opacity={0.85} />)}
+                {barData.map((_, i) => (
+                  <Cell key={i} fill={(modelCards[i] && modelCards[i].color) || "#38bdf8"} opacity={0.85} />
+                ))}
               </Bar>
               <Bar dataKey="F1" radius={[4, 4, 0, 0]}>
-                {barData.map((_, i) => <Cell key={i} fill={models[i].color} opacity={0.4} />)}
+                {barData.map((_, i) => (
+                  <Cell key={i} fill={(modelCards[i] && modelCards[i].color) || "#a78bfa"} opacity={0.4} />
+                ))}
               </Bar>
             </BarChart>
           </ResponsiveContainer>
@@ -183,7 +241,7 @@ export default function MLModelsPage() {
         {/* Confusion matrix */}
         <div className="glass rounded-xl p-5">
           <div className="font-display text-xs font-bold mb-3" style={{ color: "#94a3b8", letterSpacing: "0.1em" }}>
-            CONFUSION MATRIX — XGBoost
+            CONFUSION MATRIX — {analytics.model_name.toUpperCase()}
           </div>
           <div className="grid grid-cols-2 gap-3 mb-4">
             {confusionData.map((c) => (
@@ -202,16 +260,16 @@ export default function MLModelsPage() {
           </div>
           <div className="space-y-2">
             <div className="flex justify-between text-xs font-mono">
-              <span style={{ color: "#64748b" }}>Specificity</span>
-              <span style={{ color: "#34d399" }}>98.6%</span>
+              <span style={{ color: "#64748b" }}>Accuracy</span>
+              <span style={{ color: "#34d399" }}>{analytics.accuracy.toFixed(1)}%</span>
             </div>
             <div className="flex justify-between text-xs font-mono">
-              <span style={{ color: "#64748b" }}>Matthews CC</span>
-              <span style={{ color: "#38bdf8" }}>0.968</span>
+              <span style={{ color: "#64748b" }}>Precision</span>
+              <span style={{ color: "#38bdf8" }}>{analytics.precision.toFixed(1)}%</span>
             </div>
             <div className="flex justify-between text-xs font-mono">
-              <span style={{ color: "#64748b" }}>AUC-ROC</span>
-              <span style={{ color: "#a78bfa" }}>0.994</span>
+              <span style={{ color: "#64748b" }}>F1 Score</span>
+              <span style={{ color: "#a78bfa" }}>{analytics.f1_score.toFixed(1)}%</span>
             </div>
           </div>
         </div>
