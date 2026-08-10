@@ -3,8 +3,8 @@ import {
   AreaChart, Area, XAxis, YAxis, CartesianGrid,
   Tooltip, ResponsiveContainer, Legend
 } from "recharts";
-import api from "../api/api";
-import { buildDashboardSnapshot, type DashboardData, type TopologyNode, type TrafficPoint } from "../utils/dashboardState";
+import api from "../api/api.ts";
+import { buildDashboardSnapshot, type DashboardData, type TopologyNode, type TrafficPoint } from "../utils/dashboardState.ts";
 
 const initialDashboardData: DashboardData = {
   network_health: 94,

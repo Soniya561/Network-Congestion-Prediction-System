@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { RadarChart, Radar, PolarGrid, PolarAngleAxis, ResponsiveContainer, BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, Cell } from "recharts";
-import api from "../api/api";
+import api from "../api/api.ts";
 
 interface AnalyticsMetrics {
   model_name: string;

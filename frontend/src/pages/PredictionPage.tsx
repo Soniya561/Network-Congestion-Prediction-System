@@ -1,8 +1,8 @@
 import { useState } from "react";
 import Papa from "papaparse";
-import api from "../api/api";
+import api from "../api/api.ts";
 import { RadarChart, Radar, PolarGrid, PolarAngleAxis, PolarRadiusAxis, ResponsiveContainer, AreaChart, Area, XAxis, YAxis, CartesianGrid, Tooltip } from "recharts";
-import { buildDashboardSnapshot } from "../utils/dashboardState";
+import { buildDashboardSnapshot } from "../utils/dashboardState.ts";
 
 const radarData = [
   { subject: "Latency", A: 85, fullMark: 100 },
@@ -58,10 +58,8 @@ export default function PredictionPage() {
         throw new Error("CSV file is empty");
       }
 
-      // Get the first data row
+      // Preserve the established prediction flow: one inference for the first CSV row.
       const firstRow = parsed.data[0] as Record<string, string>;
-
-      // Convert CSV row to backend format with proper numeric types
       const predictionData = {
         Traffic_Volume_Bytes: Number(firstRow.Traffic_Volume_Bytes),
         Packets_Per_Second: Number(firstRow.Packets_Per_Second),

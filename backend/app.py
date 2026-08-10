@@ -5,7 +5,7 @@ from pathlib import Path
 import joblib
 import numpy as np
 import pandas as pd
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from scipy.stats import ks_2samp
@@ -24,6 +24,11 @@ app = FastAPI(
 
 @app.get("/mlops")
 def mlops():
+    """Compatibility route for clients using the former monitoring URL."""
+    return build_mlops_status()
+
+    # Deprecated simulated monitoring implementation retained below only as
+    # unreachable compatibility source while the route above serves real state.
     # Load dataset
     dataset = pd.read_csv(DATASET_PATH)
 
@@ -136,6 +141,25 @@ latest_state = {
     "congestion_level": "Low",
     "confidence": 98.6,
     "telemetry": dict(default_telemetry),
+    "updated_at": time.time(),
+}
+
+initial_incident_time = time.time()
+incident_state = {
+    "id": 1,
+    "prediction_key": "Low|98.6",
+    "prediction": "Low",
+    "status": "stable",
+    "created_at": initial_incident_time - 1,
+    "resolved_at": None,
+    "mttr": None,
+    "active_alerts": 0,
+    "resolved_today": 0,
+    "escalations": 0,
+    "timeline": [
+        {"at": initial_incident_time - 2, "type": "Prediction Generated", "description": "Low congestion detected by Random Forest model", "color": "#34d399"},
+        {"at": initial_incident_time - 1, "type": "Alert Created", "description": "NOC alert created from latest backend prediction", "color": "#34d399"},
+    ],
 }
 
 
@@ -284,8 +308,14 @@ app.add_middleware(
 # Load trained model and label encoder
 model_path = BACKEND_DIR / "network_congestion_model.pkl"
 encoder_path = BACKEND_DIR / "label_encoder.pkl"
-model = joblib.load(model_path)
-encoder = joblib.load(encoder_path)
+model = None
+encoder = None
+model_load_error = None
+try:
+    model = joblib.load(model_path)
+    encoder = joblib.load(encoder_path)
+except Exception as error:
+    model_load_error = str(error)
 
 DATASET_PATH = PROJECT_ROOT / "data" / "networkdataset.csv"
 FEATURE_COLUMNS = [
@@ -306,6 +336,117 @@ FEATURE_COLUMNS = [
 ]
 TARGET_COLUMN = "Congestion_Level"
 
+DRIFT_WARNING_THRESHOLD = 0.10
+
+
+def load_reference_data() -> pd.DataFrame | None:
+    """Return the training data only when the DVC artifact is actually present."""
+    try:
+        dataset = pd.read_csv(DATASET_PATH)
+    except (OSError, pd.errors.ParserError):
+        return None
+
+    if len(dataset) < 2 or not set(FEATURE_COLUMNS).issubset(dataset.columns):
+        return None
+    return dataset[FEATURE_COLUMNS].apply(pd.to_numeric, errors="coerce").dropna()
+
+
+reference_data = load_reference_data()
+model_feature_count = int(getattr(model, "n_features_in_", len(FEATURE_COLUMNS))) if model is not None else None
+model_version = "Random Forest" if model is not None and "RandomForest" in type(model).__name__ else (type(model).__name__ if model is not None else "Unavailable")
+
+# This state starts empty and is populated only by real prediction requests.
+mlops_state = {
+    "model_version": model_version,
+    "deployment_status": "Loaded" if model is not None else "Unavailable",
+    "model_health": "Healthy" if model is not None else "Critical",
+    "prediction_latency_ms": None,
+    "records_processed": 0,
+    "total_predictions": 0,
+    "successful_predictions": 0,
+    "failed_predictions": 0,
+    "last_prediction_time": None,
+    "feature_count": model_feature_count,
+    "data_drift": None,
+    "drift_status": "Unavailable" if reference_data is None else "Pending",
+    "latency_history": [],
+    "drift_history": [],
+    "alert_dispatch_status": "Unavailable",
+    "last_prediction_level": None,
+}
+
+
+def calculate_data_drift(input_df: pd.DataFrame) -> float | None:
+    if reference_data is None:
+        return None
+
+    scores = []
+    for column in FEATURE_COLUMNS:
+        sample = input_df[column].dropna()
+        reference = reference_data[column].dropna()
+        if sample.empty or reference.empty:
+            continue
+        statistic, _ = ks_2samp(reference, sample)
+        scores.append(float(statistic))
+    return round(float(np.mean(scores)), 4) if scores else None
+
+
+def record_prediction_success(latency_ms: float, input_df: pd.DataFrame, congestion_level: str) -> None:
+    timestamp = time.time()
+    latency = round(latency_ms, 3)
+    mlops_state["prediction_latency_ms"] = latency
+    mlops_state["records_processed"] += len(input_df)
+    mlops_state["total_predictions"] += len(input_df)
+    mlops_state["successful_predictions"] += len(input_df)
+    mlops_state["last_prediction_time"] = timestamp
+    mlops_state["last_prediction_level"] = normalize_level(congestion_level)
+    mlops_state["model_health"] = "Healthy"
+    mlops_state["latency_history"].append({"time": timestamp, "latency_ms": latency})
+    del mlops_state["latency_history"][:-20]
+
+    drift_score = calculate_data_drift(input_df)
+    if drift_score is None:
+        mlops_state["data_drift"] = None
+        mlops_state["drift_status"] = "Unavailable"
+        return
+
+    mlops_state["data_drift"] = drift_score
+    mlops_state["drift_status"] = "Warning" if drift_score >= DRIFT_WARNING_THRESHOLD else "Normal"
+    mlops_state["drift_history"].append({"time": timestamp, "drift_score": drift_score})
+    del mlops_state["drift_history"][:-20]
+
+
+def record_prediction_failure(records: int = 1) -> None:
+    mlops_state["total_predictions"] += records
+    mlops_state["failed_predictions"] += records
+    mlops_state["model_health"] = "Warning" if model is not None else "Critical"
+
+
+def build_mlops_status() -> dict:
+    model_status = "Healthy" if model is not None and mlops_state["model_health"] == "Healthy" else mlops_state["model_health"]
+    return {
+        **mlops_state,
+        "model_health": model_status,
+        "pipeline": [
+            {"label": "Data Ingestion", "status": "Healthy", "color": "#34d399", "icon": "↓", "detail": f"Records processed: {mlops_state['records_processed']}"},
+            {"label": "Feature Engineering", "status": "Healthy" if model_feature_count else "Unavailable", "color": "#38bdf8", "icon": "⚙", "detail": f"Features: {model_feature_count if model_feature_count is not None else 'Unavailable'}"},
+            {"label": "Model Inference", "status": model_status, "color": "#a78bfa", "icon": "🧠", "detail": f"{model_version}; last prediction: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(mlops_state['last_prediction_time'])) if mlops_state['last_prediction_time'] else 'Unavailable'}"},
+            {"label": "Post Processing", "status": "Healthy" if mlops_state["successful_predictions"] else "Unavailable", "color": "#34d399", "icon": "✓", "detail": "Model probabilities; no decision threshold configured"},
+            {"label": "Alert Dispatch", "status": mlops_state["alert_dispatch_status"], "color": "#fbbf24", "icon": "📡", "detail": "Prediction API → Backend Alert Service"},
+        ],
+        "application_health": [
+            {"name": "Backend API", "status": "Healthy"},
+            {"name": "Random Forest Model", "status": model_status},
+        ],
+        "prediction_api_status": "Available",
+        "drift_threshold": DRIFT_WARNING_THRESHOLD if reference_data is not None else None,
+    }
+
+
+@app.get("/mlops/status")
+def mlops_status():
+    return build_mlops_status()
+
 
 # Input Schema
 class NetworkInput(BaseModel):
@@ -323,6 +464,202 @@ class NetworkInput(BaseModel):
     CPU_Utilization_Percent: float
     Memory_Utilization_Percent: float
     Link_Capacity_Mbps: float
+
+
+class AlertAction(BaseModel):
+    alert_id: int | None = None
+
+
+def normalize_level(congestion_level: str) -> str:
+    label = congestion_level.lower()
+    if "high" in label:
+        return "High"
+    if "medium" in label:
+        return "Medium"
+    return "Low"
+
+
+def priority_for(congestion_level: str) -> str:
+    return normalize_level(congestion_level).upper()
+
+
+def timeline_time(timestamp: float) -> str:
+    return time.strftime("%H:%M", time.localtime(timestamp))
+
+
+def recommendation_for(level: str) -> list[str]:
+    if level == "High":
+        return [
+            "Reroute high-volume traffic away from congested core links",
+            "Throttle non-critical backup and bulk transfer flows",
+            "Escalate to NOC lead and prepare capacity failover",
+        ]
+    if level == "Medium":
+        return [
+            "Increase monitoring on affected transit and edge links",
+            "Shift scheduled jobs to the next low-traffic window",
+            "Prepare alternate routing if latency or packet loss rises",
+        ]
+    return [
+        "Maintain current routing and QoS policy",
+        "Continue passive monitoring for the next prediction interval",
+        "Close the incident only after the backend confirms low risk",
+    ]
+
+
+def build_ai_analysis() -> dict:
+    level = normalize_level(latest_state["congestion_level"])
+    telemetry = latest_state["telemetry"]
+    dashboard_state = build_dashboard_state(level, latest_state["confidence"])
+    latency = float(telemetry["Latency_ms"])
+    packet_loss = float(telemetry["Packet_Loss_Percent"])
+    bandwidth = float(telemetry["Bandwidth_Utilization_Percent"])
+    queue = float(telemetry["Queue_Length"])
+    cpu = float(telemetry["CPU_Utilization_Percent"])
+    memory = float(telemetry["Memory_Utilization_Percent"])
+    connected_devices = dashboard_state.connected_devices
+
+    risk_summary = (
+        f"{level} congestion risk with {latest_state['confidence']}% model confidence, "
+        f"{dashboard_state.network_health}% network health, {latency:.1f} ms latency, "
+        f"and {packet_loss:.2f}% packet loss across {connected_devices:,} connected devices."
+    )
+
+    cause_signals = [
+        ("bandwidth utilization", bandwidth),
+        ("queue length", queue / 5),
+        ("latency", latency * 2),
+        ("CPU utilization", cpu),
+        ("memory utilization", memory),
+        ("packet loss", packet_loss * 20),
+    ]
+    strongest_signal = max(cause_signals, key=lambda item: item[1])[0]
+    root_cause = (
+        f"The strongest contributing signal is {strongest_signal}, supported by current telemetry "
+        f"from the latest Random Forest prediction request."
+    )
+
+    expected_impact = {
+        "High": "User-facing applications may experience delays, retransmissions, and service degradation without immediate mitigation.",
+        "Medium": "Sensitive workloads may see intermittent latency while the network remains serviceable.",
+        "Low": "No material service impact is expected if current telemetry remains stable.",
+    }[level]
+
+    return {
+        "prediction": level,
+        "confidence": latest_state["confidence"],
+        "latency_ms": latency,
+        "packet_loss_percent": packet_loss,
+        "network_health": dashboard_state.network_health,
+        "connected_devices": connected_devices,
+        "risk_summary": risk_summary,
+        "root_cause": root_cause,
+        "expected_impact": expected_impact,
+        "recommendations": recommendation_for(level),
+    }
+
+
+def sync_incident_with_latest_prediction() -> None:
+    global incident_state
+    level = normalize_level(latest_state["congestion_level"])
+    prediction_key = f"{level}|{latest_state['confidence']}|{latest_state['updated_at']}"
+
+    if incident_state["prediction_key"] == prediction_key:
+        return
+
+    now = time.time()
+    color = "#f87171" if level == "High" else "#fbbf24" if level == "Medium" else "#34d399"
+    status = "investigating" if level in ("High", "Medium") else "stable"
+    timeline = [
+        {"at": now - 2, "type": "Prediction Generated", "description": f"{level} congestion detected by Random Forest model", "color": color},
+        {"at": now - 1, "type": "Alert Created", "description": "NOC alert created from latest backend prediction", "color": color},
+    ]
+    if status == "investigating":
+        timeline.append({
+            "at": now,
+            "type": "Investigation Started",
+            "description": "Investigation started from backend incident state.",
+            "color": "#fbbf24",
+        })
+
+    incident_state = {
+        "id": int(incident_state["id"]) + 1,
+        "prediction_key": prediction_key,
+        "prediction": level,
+        "status": status,
+        "created_at": now - 1,
+        "resolved_at": None,
+        "mttr": None,
+        "active_alerts": 1 if level in ("High", "Medium") else 0,
+        "resolved_today": int(incident_state["resolved_today"]),
+        "escalations": int(incident_state["escalations"]),
+        "timeline": timeline,
+    }
+
+
+def build_alert_response() -> dict:
+    sync_incident_with_latest_prediction()
+    level = normalize_level(latest_state["congestion_level"])
+    priority = priority_for(level)
+    dashboard_state = build_dashboard_state(level, latest_state["confidence"])
+    active_alerts = 1 if level in ("High", "Medium") and incident_state["status"] != "resolved" else 0
+    under_investigation = 1 if level in ("High", "Medium") and incident_state["status"] != "resolved" else 0
+    incident_state["prediction"] = level
+    incident_state["active_alerts"] = active_alerts
+
+    alert = {
+        "id": incident_state["id"],
+        "priority": priority,
+        "title": f"{level.upper()} CONGESTION ALERT",
+        "location": f"Network operations - {dashboard_state.status}",
+        "reasons": [
+            f"Random Forest prediction level is {level}",
+            f"Model confidence is {latest_state['confidence']}%",
+            f"Network health is {dashboard_state.network_health}%",
+            f"Connected devices: {dashboard_state.connected_devices:,}",
+        ],
+        "recommendations": recommendation_for(level),
+        "time": "Live",
+        "status": incident_state["status"],
+        "createdAt": int(incident_state["created_at"] * 1000),
+        "resolvedAt": int(incident_state["resolved_at"] * 1000) if incident_state["resolved_at"] else None,
+    }
+
+    return {
+        "alert": alert,
+        "timeline": [
+            {
+                "timestamp": item["at"],
+                "time": timeline_time(item["at"]),
+                "event_type": item["type"],
+                "description": item["description"],
+                "color": item["color"],
+            }
+            for _, item in sorted(
+                enumerate(incident_state["timeline"]),
+                key=lambda indexed_event: (indexed_event[1]["at"], indexed_event[0]),
+                reverse=True,
+            )
+        ],
+        "summary": {
+            "active_alerts": incident_state["active_alerts"],
+            "under_investigation": under_investigation,
+            "resolved_today": incident_state["resolved_today"],
+            "mttr": incident_state["mttr"],
+            "ai_accuracy": latest_state["confidence"],
+            "escalation_count": incident_state["escalations"],
+        },
+        "network": {
+            "network_health": dashboard_state.network_health,
+            "current_congestion": level,
+            "confidence": latest_state["confidence"],
+            "prediction_next": dashboard_state.prediction_next,
+            "connected_devices": dashboard_state.connected_devices,
+            "status": dashboard_state.status,
+            "metrics": compute_metrics(latest_state["telemetry"], level),
+        },
+        "analysis": build_ai_analysis(),
+    }
 
 
 # Home API
@@ -359,6 +696,10 @@ def dashboard():
 @app.post("/predict")
 def predict(data: NetworkInput):
 
+    if model is None or encoder is None:
+        record_prediction_failure()
+        raise HTTPException(status_code=503, detail="Random Forest model is unavailable.")
+
     input_df = pd.DataFrame([{
         "Traffic_Volume_Bytes": data.Traffic_Volume_Bytes,
         "Packets_Per_Second": data.Packets_Per_Second,
@@ -380,11 +721,14 @@ def predict(data: NetworkInput):
     print("\n========== INPUT RECEIVED ==========")
     print(input_df)
 
-    # Predict class
-    prediction = model.predict(input_df)
-
-    # Predict probabilities
-    probabilities = model.predict_proba(input_df)
+    try:
+        inference_started = time.perf_counter()
+        prediction = model.predict(input_df)
+        inference_latency_ms = (time.perf_counter() - inference_started) * 1000
+        probabilities = model.predict_proba(input_df)
+    except Exception:
+        record_prediction_failure(len(input_df))
+        raise
 
     # Confidence of predicted class
     predicted_index = prediction[0]
@@ -406,13 +750,90 @@ def predict(data: NetworkInput):
         "congestion_level": congestion_level,
         "confidence": confidence,
         "telemetry": data.model_dump(),
+        "updated_at": time.time(),
     }
+
+    record_prediction_success(inference_latency_ms, input_df, congestion_level)
+    sync_incident_with_latest_prediction()
+    mlops_state["alert_dispatch_status"] = "Dispatched"
 
     # Return response
     return {
         "prediction": congestion_level,
         "confidence": confidence
     }
+
+
+@app.get("/alerts")
+def alerts():
+    return build_alert_response()
+
+
+@app.post("/alerts/escalate")
+def escalate_alert(_action: AlertAction):
+    sync_incident_with_latest_prediction()
+    if incident_state["status"] == "resolved":
+        return {
+            "success": False,
+            "resolved": True,
+            "message": "Alert already resolved.",
+            **build_alert_response(),
+        }
+
+    now = time.time()
+    incident_state["status"] = "escalated"
+    incident_state["escalations"] += 1
+    incident_state["timeline"].append({
+        "at": now,
+        "type": "Escalated",
+        "description": "Alert escalated to Network Operations Center.",
+        "color": "#fbbf24",
+    })
+
+    return {
+        "escalated": True,
+        "message": "Alert escalated to Network Operations Center.",
+        **build_alert_response(),
+    }
+
+
+@app.post("/alerts/resolve")
+def resolve_alert(_action: AlertAction):
+    sync_incident_with_latest_prediction()
+    level = normalize_level(latest_state["congestion_level"])
+
+    if level in ("High", "Medium"):
+        return {
+            "resolved": False,
+            "message": "Cannot resolve.\nAI still detects congestion.",
+            **build_alert_response(),
+        }
+
+    if incident_state["status"] != "resolved":
+        now = time.time()
+        incident_state["status"] = "resolved"
+        incident_state["resolved_at"] = now
+        duration_minutes = max(0, round((now - float(incident_state["created_at"])) / 60, 1))
+        incident_state["mttr"] = duration_minutes
+        incident_state["active_alerts"] = 0
+        incident_state["resolved_today"] += 1
+        incident_state["timeline"].append({
+            "at": now,
+            "type": "Resolved",
+            "description": "Incident resolved after backend confirmed Low congestion.",
+            "color": "#34d399",
+        })
+
+    return {
+        "resolved": True,
+        "message": "Backend confirmed congestion is clear.",
+        **build_alert_response(),
+    }
+
+
+@app.get("/ai-analysis")
+def ai_analysis():
+    return build_ai_analysis()
 
 
 @app.get("/analytics")
