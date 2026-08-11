@@ -1,426 +1,117 @@
-import { useState, useEffect, useRef } from "react";
-import {
-  AreaChart, Area, XAxis, YAxis, CartesianGrid,
-  Tooltip, ResponsiveContainer, Legend
-} from "recharts";
+import { useEffect, useState } from "react";
+import { Area, AreaChart, CartesianGrid, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
 import api from "../api/api.ts";
-import { buildDashboardSnapshot, type DashboardData, type TopologyNode, type TrafficPoint } from "../utils/dashboardState.ts";
+import type { DashboardData, TopologyNode } from "../utils/dashboardState.ts";
 
-const initialDashboardData: DashboardData = {
-  network_health: 94,
-  current_congestion: "Low",
-  confidence: 98.6,
-  prediction_next: "Possible congestion in 10 min",
-  connected_devices: 2400000,
-  status: "Stable",
-  topology_nodes: [
-    { id: "dc1", x: 200, y: 150, type: "datacenter", status: "healthy", label: "DC Mumbai" },
-    { id: "dc2", x: 550, y: 100, type: "datacenter", status: "healthy", label: "DC Chennai" },
-    { id: "dc3", x: 380, y: 280, type: "cloud", status: "healthy", label: "AWS Asia" },
-    { id: "r1", x: 140, y: 250, type: "router", status: "healthy", label: "Edge-01" },
-    { id: "r2", x: 460, y: 200, type: "router", status: "healthy", label: "Core-07" },
-    { id: "r3", x: 300, y: 160, type: "router", status: "healthy", label: "Transit-03" },
-    { id: "c1", x: 620, y: 240, type: "cloud", status: "healthy", label: "Azure East" },
-    { id: "d1", x: 80, y: 320, type: "device", status: "healthy", label: "IoT-Cluster" },
-    { id: "d2", x: 540, y: 320, type: "device", status: "healthy", label: "CDN-Node" },
-  ],
-  edges: [
-    ["dc1", "r3"], ["dc2", "r2"], ["r3", "r2"], ["r3", "dc3"], ["r2", "dc3"],
-    ["r1", "dc1"], ["d1", "r1"], ["dc3", "r2"], ["r2", "c1"], ["c1", "d2"],
-  ],
-  traffic_data: [
-    { time: "00:00", traffic: 42, predicted: 45, threshold: 80 },
-    { time: "02:00", traffic: 38, predicted: 40, threshold: 80 },
-    { time: "04:00", traffic: 31, predicted: 33, threshold: 80 },
-    { time: "06:00", traffic: 55, predicted: 58, threshold: 80 },
-    { time: "08:00", traffic: 72, predicted: 75, threshold: 80 },
-    { time: "10:00", traffic: 68, predicted: 70, threshold: 80 },
-    { time: "12:00", traffic: 85, predicted: 88, threshold: 80 },
-    { time: "14:00", traffic: 78, predicted: 82, threshold: 80 },
-    { time: "16:00", traffic: 92, predicted: 95, threshold: 80 },
-    { time: "18:00", traffic: 88, predicted: 91, threshold: 80 },
-    { time: "20:00", traffic: 65, predicted: 68, threshold: 80 },
-    { time: "22:00", traffic: 52, predicted: 55, threshold: 80 },
-  ],
-  metrics: {
-    total_bandwidth: "0.9 Gbps",
-    avg_latency: "12.4 ms",
-    packet_loss: "0.02%",
-    uptime: "99.97%",
-  },
-};
+interface ReportsData {
+  traffic_history: Array<{ created_at_utc: string; bandwidth_utilization_percent: number }>;
+}
 
-const statusColor: Record<string, string> = {
-  healthy: "#34d399",
-  warning: "#fbbf24",
-  congested: "#f87171",
-  predicted: "#38bdf8",
-};
-
-function NetworkMap({ nodes, edges }: { nodes: TopologyNode[]; edges: string[][] }) {
-  const [packets, setPackets] = useState<{ id: number; fromNode: string; toNode: string; t: number }[]>([]);
-  const idRef = useRef(0);
-  const edgesRef = useRef(edges);
-  edgesRef.current = edges;
-
-  useEffect(() => {
-    const id = setInterval(() => {
-      const currentEdges = edgesRef.current;
-      if (currentEdges.length === 0) return;
-      const edge = currentEdges[Math.floor(Math.random() * currentEdges.length)];
-      const reverse = Math.random() > 0.5;
-      setPackets((prev) => [
-        ...prev.filter((p) => p.t < 1),
-        { id: idRef.current++, fromNode: reverse ? edge[1] : edge[0], toNode: reverse ? edge[0] : edge[1], t: 0 },
-      ]);
-    }, 400);
-    return () => clearInterval(id);
-  }, []);
-
-  useEffect(() => {
-    const raf = requestAnimationFrame(function step() {
-      setPackets((prev) =>
-        prev.map((p) => ({ ...p, t: p.t + 0.015 })).filter((p) => p.t <= 1)
-      );
-      requestAnimationFrame(step);
-    });
-    return () => cancelAnimationFrame(raf);
-  }, []);
-
-  const nodeById = Object.fromEntries(nodes.map((n) => [n.id, n]));
-
+function NetworkVisualization({ nodes, edges }: { nodes: TopologyNode[]; edges: string[][] }) {
+  const nodeById = Object.fromEntries(nodes.map((node) => [node.id, node]));
   return (
     <svg width="700" height="400" className="w-full h-full" viewBox="0 0 700 400">
-      <defs>
-        {nodes.map((n) => (
-          <radialGradient key={n.id} id={`glow-${n.id}`}>
-            <stop offset="0%" stopColor={statusColor[n.status]} stopOpacity="0.4" />
-            <stop offset="100%" stopColor={statusColor[n.status]} stopOpacity="0" />
-          </radialGradient>
-        ))}
-      </defs>
-
-      {/* Grid lines */}
-      {Array.from({ length: 10 }).map((_, i) => (
-        <line key={`h${i}`} x1="0" y1={i * 40} x2="700" y2={i * 40} stroke="rgba(56,189,248,0.05)" strokeWidth="1" />
-      ))}
-      {Array.from({ length: 18 }).map((_, i) => (
-        <line key={`v${i}`} x1={i * 40} y1="0" x2={i * 40} y2="400" stroke="rgba(56,189,248,0.05)" strokeWidth="1" />
-      ))}
-
-      {/* Edges */}
-      {edges.map(([fromId, toId], i) => {
+      {Array.from({ length: 10 }).map((_, index) => <line key={`h${index}`} x1="0" y1={index * 40} x2="700" y2={index * 40} stroke="rgba(56,189,248,0.05)" strokeWidth="1" />)}
+      {Array.from({ length: 18 }).map((_, index) => <line key={`v${index}`} x1={index * 40} y1="0" x2={index * 40} y2="400" stroke="rgba(56,189,248,0.05)" strokeWidth="1" />)}
+      {edges.map(([fromId, toId], index) => {
         const from = nodeById[fromId];
         const to = nodeById[toId];
         if (!from || !to) return null;
-        return (
-          <line
-            key={i}
-            x1={from.x} y1={from.y}
-            x2={to.x} y2={to.y}
-            stroke="rgba(56,189,248,0.2)"
-            strokeWidth="1.5"
-            strokeDasharray="4 4"
-          />
-        );
+        return <line key={index} x1={from.x} y1={from.y} x2={to.x} y2={to.y} stroke="rgba(56,189,248,0.2)" strokeWidth="1.5" strokeDasharray="4 4" />;
       })}
-
-      {/* Packets */}
-      {packets.map((p) => {
-        const from = nodeById[p.fromNode];
-        const to = nodeById[p.toNode];
-        if (!from || !to) return null;
-        const x = from.x + (to.x - from.x) * p.t;
-        const y = from.y + (to.y - from.y) * p.t;
-        return (
-          <circle key={p.id} cx={x} cy={y} r="3" fill="#38bdf8" opacity={1 - p.t * 0.5}>
-            <animate attributeName="r" values="2;4;2" dur="0.5s" repeatCount="indefinite" />
-          </circle>
-        );
-      })}
-
-      {/* Nodes */}
-      {nodes.map((n) => (
-        <g key={n.id}>
-          <circle cx={n.x} cy={n.y} r="20" fill={`url(#glow-${n.id})`} />
-          <circle
-            cx={n.x} cy={n.y} r="12"
-            fill="rgba(15,23,42,0.9)"
-            stroke={statusColor[n.status]}
-            strokeWidth="2"
-            style={{ filter: `drop-shadow(0 0 6px ${statusColor[n.status]})` }}
-          />
-          <text x={n.x} y={n.y} textAnchor="middle" dominantBaseline="middle" fill={statusColor[n.status]} fontSize="10">
-            {n.type === "datacenter" ? "⬡" : n.type === "cloud" ? "☁" : n.type === "router" ? "◈" : "◉"}
-          </text>
-          <text x={n.x} y={n.y + 22} textAnchor="middle" fill="rgba(148,163,184,0.8)" fontSize="8" fontFamily="JetBrains Mono">
-            {n.label}
-          </text>
+      {nodes.map((node) => (
+        <g key={node.id}>
+          <circle cx={node.x} cy={node.y} r="12" fill="rgba(15,23,42,0.9)" stroke="#38bdf8" strokeWidth="2" />
+          <text x={node.x} y={node.y} textAnchor="middle" dominantBaseline="middle" fill="#38bdf8" fontSize="10">{node.type === "datacenter" ? "◆" : node.type === "cloud" ? "☁" : node.type === "router" ? "◈" : "◉"}</text>
+          <text x={node.x} y={node.y + 22} textAnchor="middle" fill="rgba(148,163,184,0.8)" fontSize="8" fontFamily="JetBrains Mono">{node.label}</text>
         </g>
       ))}
     </svg>
   );
 }
 
-const statsCards = (
-  data: DashboardData
-) => [
-  {
-    title: "NETWORK HEALTH",
-    value: data.network_health,
-    sub: data.status,
-    color: "#34d399",
-    icon: "◎",
-    ring: true,
-    extra: "↑ 2.3% from yesterday",
-  },
-  {
-    title: "CURRENT CONGESTION",
-    value: data.current_congestion.toUpperCase(),
-    sub: `Confidence: ${data.confidence}%`,
-    color: "#38bdf8",
-    icon: "◈",
-    ring: false,
-    extra: "All corridors nominal",
-  },
-  {
-    title: "AI PREDICTION",
-    value: data.prediction_next,
-    sub: "AI forecast",
-    color: "#fbbf24",
-    icon: "⚡",
-    ring: false,
-    extra: "Confidence values from model",
-  },
-  {
-    title: "CONNECTED DEVICES",
-    value: data.connected_devices >= 1000000 ? `${(data.connected_devices / 1000000).toFixed(1)}M` : `${data.connected_devices}`,
-    sub: "Active endpoints",
-    color: "#a78bfa",
-    icon: "⬡",
-    ring: false,
-    extra: "↑ 12K in last hour",
-  },
-];
-
-function CircularGauge({ value, color }: { value: number; color: string }) {
-  const r = 36;
-  const circ = 2 * Math.PI * r;
-  const offset = circ - (value / 100) * circ;
-  return (
-    <svg width="88" height="88" className="animate-spin-slow" style={{ animationDirection: "reverse" }}>
-      <circle cx="44" cy="44" r={r} fill="none" stroke="rgba(56,189,248,0.1)" strokeWidth="6" />
-      <circle
-        cx="44" cy="44" r={r} fill="none"
-        stroke={color} strokeWidth="6"
-        strokeDasharray={circ} strokeDashoffset={offset}
-        strokeLinecap="round"
-        transform="rotate(-90 44 44)"
-        style={{ filter: `drop-shadow(0 0 6px ${color})`, animation: "none" }}
-      />
-      <text x="44" y="49" textAnchor="middle" fill={color} fontSize="16" fontFamily="Orbitron" fontWeight="700">
-        {value}%
-      </text>
-    </svg>
-  );
-}
-
 export default function DashboardPage() {
   const [time, setTime] = useState(new Date());
-  const [dashboardData, setDashboardData] = useState<DashboardData>(initialDashboardData);
-  const hasPredictionSnapshotRef = useRef(false);
+  const [dashboardData, setDashboardData] = useState<DashboardData | null>(null);
+  const [telemetry, setTelemetry] = useState<ReportsData["traffic_history"]>([]);
 
   useEffect(() => {
-    const fetchDashboard = async () => {
-      if (hasPredictionSnapshotRef.current) {
-        return;
-      }
-
-      try {
-        const response = await api.get<DashboardData>("/dashboard");
-        setDashboardData(response.data);
-      } catch (error) {
-        console.error("Unable to load dashboard data", error);
-      }
+    let active = true;
+    const loadDashboard = async () => {
+      const [dashboardResult, reportsResult] = await Promise.allSettled([
+        api.get<DashboardData>("/dashboard"),
+        api.get<ReportsData>("/reports"),
+      ]);
+      if (!active) return;
+      setDashboardData(dashboardResult.status === "fulfilled" ? dashboardResult.value.data : null);
+      setTelemetry(reportsResult.status === "fulfilled" ? reportsResult.value.data.traffic_history : []);
     };
-
-    const handleSnapshot = (event: Event) => {
-      const detail = (event as CustomEvent<DashboardData>).detail;
-      if (detail) {
-        hasPredictionSnapshotRef.current = true;
-        setDashboardData(detail);
-      }
-    };
-
-    fetchDashboard();
-    window.addEventListener("network-dashboard-update", handleSnapshot as EventListener);
-    // Poll every 5 seconds so the dashboard stays live
-    const id = setInterval(fetchDashboard, 5000);
+    void loadDashboard();
+    const id = window.setInterval(() => void loadDashboard(), 5000);
     return () => {
-      clearInterval(id);
-      window.removeEventListener("network-dashboard-update", handleSnapshot as EventListener);
+      active = false;
+      window.clearInterval(id);
     };
   }, []);
 
   useEffect(() => {
-    const id = setInterval(() => setTime(new Date()), 1000);
+    const id = window.setInterval(() => setTime(new Date()), 1000);
     return () => clearInterval(id);
   }, []);
 
-  const cards = statsCards(dashboardData);
-  const metrics = dashboardData.metrics;
-
-  const bottomStats = [
-    { label: "TOTAL BANDWIDTH", value: metrics.total_bandwidth, color: "#38bdf8" },
-    { label: "AVG LATENCY", value: metrics.avg_latency, color: "#34d399" },
-    { label: "PACKET LOSS", value: metrics.packet_loss, color: "#34d399" },
-    { label: "UPTIME", value: metrics.uptime, color: "#a78bfa" },
-  ];
+  const chartData = telemetry.map((point) => ({
+    timestamp: new Date(point.created_at_utc).toLocaleString("en-IN", { hour12: false }),
+    bandwidth: point.bandwidth_utilization_percent,
+  }));
+  const metrics = dashboardData?.metrics;
 
   return (
     <div className="p-6 space-y-6">
-      {/* Header */}
       <div className="flex items-center justify-between">
         <div>
-          <h1 className="font-display text-2xl font-bold text-glow-blue" style={{ color: "#38bdf8" }}>
-            AI NETWORK COMMAND CENTER
-          </h1>
-          <p className="text-sm mt-1" style={{ color: "#64748b" }}>
-            Real-time network intelligence — predictive congestion management
-          </p>
+          <h1 className="font-display text-2xl font-bold text-glow-blue" style={{ color: "#38bdf8" }}>AI NETWORK COMMAND CENTER</h1>
+          <p className="text-sm mt-1" style={{ color: "#64748b" }}>Current model prediction and submitted network telemetry</p>
         </div>
         <div className="text-right">
-          <div className="font-mono text-lg" style={{ color: "#38bdf8" }}>
-            {time.toLocaleTimeString("en-IN", { hour12: false })}
-          </div>
-          <div className="font-mono text-xs" style={{ color: "#475569" }}>
-            {time.toLocaleDateString("en-IN", { day: "2-digit", month: "short", year: "numeric" })}
-          </div>
+          <div className="font-mono text-lg" style={{ color: "#38bdf8" }}>{time.toLocaleTimeString("en-IN", { hour12: false })}</div>
+          <div className="font-mono text-xs" style={{ color: "#475569" }}>{time.toLocaleDateString("en-IN", { day: "2-digit", month: "short", year: "numeric" })}</div>
         </div>
       </div>
 
-      {/* Stat cards */}
-      <div className="grid grid-cols-4 gap-4">
-        {cards.map((card, i) => (
-          <div
-            key={i}
-            className="glass rounded-xl p-5 card-hover"
-            style={{ border: `1px solid ${card.color}20` }}
-          >
-            <div className="flex items-start justify-between mb-4">
-              <div>
-                <div className="font-mono text-xs mb-3" style={{ color: "#64748b", letterSpacing: "0.1em" }}>
-                  {card.title}
-                </div>
-                {card.ring ? (
-                  <CircularGauge value={parseInt(String(card.value))} color={card.color} />
-                ) : (
-                  <div
-                    className="font-display text-3xl font-black"
-                    style={{ color: card.color, textShadow: `0 0 20px ${card.color}60` }}
-                  >
-                    {card.value}
-                  </div>
-                )}
-              </div>
-              <div
-                className="w-10 h-10 rounded-lg flex items-center justify-center text-xl"
-                style={{
-                  background: `${card.color}15`,
-                  border: `1px solid ${card.color}30`,
-                  color: card.color,
-                }}
-              >
-                {card.icon}
-              </div>
-            </div>
-            <div className="space-y-1">
-              <div className="text-sm font-medium" style={{ color: card.color }}>
-                {card.sub}
-              </div>
-              <div className="text-xs" style={{ color: "#475569" }}>
-                {card.extra}
-              </div>
-            </div>
-          </div>
-        ))}
+      <div className="grid grid-cols-2 gap-4">
+        <div className="glass rounded-xl p-5" style={{ border: "1px solid #38bdf820" }}>
+          <div className="font-mono text-xs mb-3" style={{ color: "#64748b", letterSpacing: "0.1em" }}>CURRENT CONGESTION</div>
+          <div className="font-display text-3xl font-black" style={{ color: "#38bdf8" }}>{dashboardData?.current_congestion?.toUpperCase() ?? "Unavailable"}</div>
+          <div className="text-sm font-medium mt-2" style={{ color: "#38bdf8" }}>Model confidence: {dashboardData ? `${dashboardData.confidence.toFixed(2)}%` : "Unavailable"}</div>
+        </div>
+        <div className="glass rounded-xl p-5" style={{ border: "1px solid #a78bfa20" }}>
+          <div className="font-mono text-xs mb-3" style={{ color: "#64748b", letterSpacing: "0.1em" }}>ACTIVE USERS</div>
+          <div className="font-display text-3xl font-black" style={{ color: "#a78bfa" }}>{dashboardData ? dashboardData.active_users.toLocaleString() : "Unavailable"}</div>
+          <div className="text-xs mt-2" style={{ color: "#475569" }}>Current submitted prediction telemetry</div>
+        </div>
       </div>
 
-      {/* Network map + chart */}
       <div className="grid grid-cols-5 gap-4">
-        {/* Network map */}
-        <div className="col-span-3 glass rounded-xl p-4" style={{ height: "420px" }}>
-          <div className="flex items-center justify-between mb-3">
-            <div>
-              <h2 className="font-display text-sm font-bold" style={{ color: "#e2e8f0" }}>
-                LIVE NETWORK TOPOLOGY
-              </h2>
-              <p className="text-xs" style={{ color: "#64748b" }}>Holographic infrastructure map</p>
-            </div>
-            <div className="flex gap-3 text-xs font-mono">
-              {[["#34d399", "Healthy"], ["#fbbf24", "Warning"], ["#f87171", "Congested"], ["#38bdf8", "Predicted"]].map(([c, l]) => (
-                <div key={l} className="flex items-center gap-1.5">
-                  <div className="w-2 h-2 rounded-full" style={{ background: c, boxShadow: `0 0 6px ${c}` }} />
-                  <span style={{ color: "#64748b" }}>{l}</span>
-                </div>
-              ))}
-            </div>
-          </div>
-          <div className="h-full">
-            <NetworkMap nodes={dashboardData.topology_nodes} edges={dashboardData.edges} />
-          </div>
+        <div className="col-span-2 glass rounded-xl p-4" style={{ height: "420px" }}>
+          <div className="mb-3"><h2 className="font-display text-sm font-bold" style={{ color: "#e2e8f0" }}>NETWORK VISUALIZATION</h2><p className="text-xs" style={{ color: "#64748b" }}>Illustrative infrastructure view</p></div>
+          <div className="h-full"><NetworkVisualization nodes={dashboardData?.topology_nodes ?? []} edges={dashboardData?.edges ?? []} /></div>
         </div>
-
-        {/* Traffic chart */}
-        <div className="col-span-2 glass rounded-xl p-4">
-          <div className="mb-3">
-            <h2 className="font-display text-sm font-bold" style={{ color: "#e2e8f0" }}>
-              TRAFFIC ANALYSIS
-            </h2>
-            <p className="text-xs" style={{ color: "#64748b" }}>24-hour bandwidth utilization vs AI prediction</p>
-          </div>
-          <ResponsiveContainer width="100%" height={320}>
-            <AreaChart data={dashboardData.traffic_data}>
-              <defs>
-                <linearGradient id="trafficGrad" x1="0" y1="0" x2="0" y2="1">
-                  <stop offset="5%" stopColor="#38bdf8" stopOpacity={0.3} />
-                  <stop offset="95%" stopColor="#38bdf8" stopOpacity={0} />
-                </linearGradient>
-                <linearGradient id="predictGrad" x1="0" y1="0" x2="0" y2="1">
-                  <stop offset="5%" stopColor="#818cf8" stopOpacity={0.3} />
-                  <stop offset="95%" stopColor="#818cf8" stopOpacity={0} />
-                </linearGradient>
-              </defs>
-              <CartesianGrid stroke="rgba(56,189,248,0.06)" />
-              <XAxis dataKey="time" tick={{ fill: "#475569", fontSize: 9, fontFamily: "JetBrains Mono" }} />
-              <YAxis tick={{ fill: "#475569", fontSize: 9, fontFamily: "JetBrains Mono" }} />
-              <Tooltip
-                contentStyle={{ background: "rgba(15,23,42,0.95)", border: "1px solid rgba(56,189,248,0.3)", borderRadius: "8px", fontFamily: "JetBrains Mono", fontSize: "11px" }}
-                labelStyle={{ color: "#94a3b8" }}
-              />
-              <Legend wrapperStyle={{ fontSize: "10px", fontFamily: "JetBrains Mono", color: "#64748b" }} />
-              <Area type="monotone" dataKey="threshold" stroke="#f87171" strokeDasharray="4 4" strokeWidth={1} fill="none" name="Threshold" />
-              <Area type="monotone" dataKey="traffic" stroke="#38bdf8" strokeWidth={2} fill="url(#trafficGrad)" name="Actual" />
-              <Area type="monotone" dataKey="predicted" stroke="#818cf8" strokeWidth={2} strokeDasharray="6 2" fill="url(#predictGrad)" name="Predicted" />
-            </AreaChart>
-          </ResponsiveContainer>
+        <div className="col-span-3 glass rounded-xl p-4">
+          <div className="mb-3"><h2 className="font-display text-sm font-bold" style={{ color: "#e2e8f0" }}>RECORDED NETWORK TELEMETRY</h2><p className="text-xs" style={{ color: "#64748b" }}>Persisted prediction records in chronological order</p></div>
+          {chartData.length > 0 ? (
+            <ResponsiveContainer width="100%" height={320}>
+              <AreaChart data={chartData}><defs><linearGradient id="trafficGrad" x1="0" y1="0" x2="0" y2="1"><stop offset="5%" stopColor="#38bdf8" stopOpacity={0.3} /><stop offset="95%" stopColor="#38bdf8" stopOpacity={0} /></linearGradient></defs><CartesianGrid stroke="rgba(56,189,248,0.06)" /><XAxis dataKey="timestamp" tick={{ fill: "#475569", fontSize: 9, fontFamily: "JetBrains Mono" }} /><YAxis domain={[0, 100]} tick={{ fill: "#475569", fontSize: 9, fontFamily: "JetBrains Mono" }} unit="%" /><Tooltip contentStyle={{ background: "rgba(15,23,42,0.95)", border: "1px solid rgba(56,189,248,0.3)", borderRadius: "8px", fontFamily: "JetBrains Mono", fontSize: "11px" }} /><Area type="monotone" dataKey="bandwidth" stroke="#38bdf8" strokeWidth={2} fill="url(#trafficGrad)" name="Bandwidth utilization" /></AreaChart>
+            </ResponsiveContainer>
+          ) : <div className="h-[320px] flex items-center justify-center text-xs font-mono" style={{ color: "#64748b" }}>No recorded prediction telemetry yet</div>}
         </div>
       </div>
 
-      {/* Bottom status bar */}
-      <div className="glass rounded-xl p-4 flex items-center justify-between">
-        <div className="flex gap-8">
-          {bottomStats.map((s) => (
-            <div key={s.label}>
-              <div className="font-mono text-xs mb-0.5" style={{ color: "#475569", letterSpacing: "0.08em" }}>{s.label}</div>
-              <div className="font-display text-base font-bold" style={{ color: s.color }}>{s.value}</div>
-            </div>
-          ))}
-        </div>
-        <div className="flex items-center gap-2">
-          <div className="w-2 h-2 rounded-full animate-blink" style={{ background: "#34d399" }} />
-          <span className="font-mono text-xs" style={{ color: "#34d399" }}>ALL SYSTEMS OPERATIONAL</span>
-        </div>
+      <div className="glass rounded-xl p-4 flex gap-8">
+        {[
+          { label: "TOTAL BANDWIDTH", value: metrics?.total_bandwidth ?? "Unavailable", color: "#38bdf8" },
+          { label: "AVG LATENCY", value: metrics?.avg_latency ?? "Unavailable", color: "#34d399" },
+          { label: "PACKET LOSS", value: metrics?.packet_loss ?? "Unavailable", color: "#34d399" },
+        ].map((stat) => <div key={stat.label}><div className="font-mono text-xs mb-0.5" style={{ color: "#475569", letterSpacing: "0.08em" }}>{stat.label}</div><div className="font-display text-base font-bold" style={{ color: stat.color }}>{stat.value}</div></div>)}
       </div>
     </div>
   );

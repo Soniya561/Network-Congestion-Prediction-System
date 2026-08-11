@@ -1,5 +1,7 @@
 import random
+import sqlite3
 import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import joblib
@@ -13,6 +15,7 @@ from sklearn.metrics import accuracy_score, confusion_matrix, f1_score, precisio
 
 BACKEND_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = BACKEND_DIR.parent
+REPORTS_DB_PATH = BACKEND_DIR / "reports_history.db"
 
 # Create FastAPI app
 app = FastAPI(
@@ -118,6 +121,140 @@ EDGES = [
     ["r1", "dc1"], ["d1", "r1"], ["dc3", "r2"], ["r2", "c1"], ["c1", "d2"],
 ]
 
+
+def utc_timestamp(timestamp: float | None = None) -> str:
+    """Return an ISO-8601 UTC timestamp for real server-side events."""
+    current = time.time() if timestamp is None else timestamp
+    return datetime.fromtimestamp(current, timezone.utc).isoformat()
+
+
+def reports_connection() -> sqlite3.Connection:
+    connection = sqlite3.connect(REPORTS_DB_PATH, timeout=1)
+    connection.row_factory = sqlite3.Row
+    connection.execute("PRAGMA foreign_keys = ON")
+    return connection
+
+
+def initialize_reports_database() -> None:
+    """Create report-history storage without affecting inference if this fails."""
+    try:
+        with reports_connection() as connection:
+            connection.executescript("""
+                CREATE TABLE IF NOT EXISTS prediction_history (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    created_at_utc TEXT NOT NULL,
+                    traffic_volume_bytes REAL NOT NULL,
+                    packets_per_second REAL NOT NULL,
+                    packet_size_bytes REAL NOT NULL,
+                    flow_duration_ms REAL NOT NULL,
+                    bandwidth_utilization_percent REAL NOT NULL,
+                    throughput_mbps REAL NOT NULL,
+                    latency_ms REAL NOT NULL,
+                    jitter_ms REAL NOT NULL,
+                    packet_loss_percent REAL NOT NULL,
+                    queue_length REAL NOT NULL,
+                    active_users REAL NOT NULL,
+                    cpu_utilization_percent REAL NOT NULL,
+                    memory_utilization_percent REAL NOT NULL,
+                    link_capacity_mbps REAL NOT NULL,
+                    predicted_congestion_level TEXT NOT NULL,
+                    confidence_percent REAL NOT NULL,
+                    inference_latency_ms REAL NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS incident_history (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    prediction_history_id INTEGER,
+                    created_at_utc TEXT NOT NULL,
+                    resolved_at_utc TEXT,
+                    congestion_level TEXT NOT NULL,
+                    confidence_percent REAL NOT NULL,
+                    status TEXT NOT NULL,
+                    escalation_count INTEGER NOT NULL DEFAULT 0,
+                    is_genuine_incident INTEGER NOT NULL DEFAULT 0,
+                    FOREIGN KEY (prediction_history_id) REFERENCES prediction_history(id)
+                );
+            """)
+            incident_columns = {
+                row["name"] for row in connection.execute("PRAGMA table_info(incident_history)")
+            }
+            if "is_genuine_incident" not in incident_columns:
+                connection.execute(
+                    "ALTER TABLE incident_history ADD COLUMN is_genuine_incident INTEGER NOT NULL DEFAULT 0"
+                )
+
+            # Earlier versions stored every prediction as an incident.  The
+            # persisted level/status can safely identify the alerts that the
+            # existing live-alert logic considered active: Medium or High.
+            connection.execute("""
+                UPDATE incident_history
+                SET is_genuine_incident = 1
+                WHERE is_genuine_incident = 0
+                  AND congestion_level IN ('Medium', 'High')
+                  AND status IN ('investigating', 'escalated')
+            """)
+    except sqlite3.Error as error:
+        print(f"Reports history database initialization failed: {error}")
+
+
+def save_prediction_history(data: "NetworkInput", congestion_level: str, confidence: float, inference_latency_ms: float) -> int | None:
+    """Persist actual successful inference input/output without changing its result."""
+    try:
+        with reports_connection() as connection:
+            cursor = connection.execute("""
+                INSERT INTO prediction_history (
+                    created_at_utc, traffic_volume_bytes, packets_per_second, packet_size_bytes,
+                    flow_duration_ms, bandwidth_utilization_percent, throughput_mbps, latency_ms,
+                    jitter_ms, packet_loss_percent, queue_length, active_users,
+                    cpu_utilization_percent, memory_utilization_percent, link_capacity_mbps,
+                    predicted_congestion_level, confidence_percent, inference_latency_ms
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                utc_timestamp(), data.Traffic_Volume_Bytes, data.Packets_Per_Second, data.Packet_Size_Bytes,
+                data.Flow_Duration_ms, data.Bandwidth_Utilization_Percent, data.Throughput_Mbps, data.Latency_ms,
+                data.Jitter_ms, data.Packet_Loss_Percent, data.Queue_Length, data.Active_Users,
+                data.CPU_Utilization_Percent, data.Memory_Utilization_Percent, data.Link_Capacity_Mbps,
+                congestion_level, confidence, round(inference_latency_ms, 3),
+            ))
+            return int(cursor.lastrowid)
+    except sqlite3.Error as error:
+        print(f"Reports prediction-history persistence failed: {error}")
+        return None
+
+
+def save_incident_history(prediction_history_id: int | None, created_at: float, congestion_level: str, confidence: float, status: str) -> int | None:
+    """Append an incident created by the existing live alert flow."""
+    try:
+        with reports_connection() as connection:
+            cursor = connection.execute("""
+                INSERT INTO incident_history (
+                    prediction_history_id, created_at_utc, congestion_level,
+                    confidence_percent, status, escalation_count, is_genuine_incident
+                ) VALUES (?, ?, ?, ?, ?, 0, 1)
+            """, (prediction_history_id, utc_timestamp(created_at), congestion_level, confidence, status))
+            return int(cursor.lastrowid)
+    except sqlite3.Error as error:
+        print(f"Reports incident-history persistence failed: {error}")
+        return None
+
+
+def update_incident_history(incident_history_id: int | None, status: str, escalation_count: int, resolved_at: float | None = None) -> None:
+    """Mirror real live-incident state changes when persistence is available."""
+    if incident_history_id is None:
+        return
+    try:
+        with reports_connection() as connection:
+            connection.execute("""
+                UPDATE incident_history
+                SET status = ?, escalation_count = ?, resolved_at_utc = COALESCE(?, resolved_at_utc)
+                WHERE id = ? AND is_genuine_incident = 1
+            """, (status, escalation_count, utc_timestamp(resolved_at) if resolved_at is not None else None, incident_history_id))
+    except sqlite3.Error as error:
+        print(f"Reports incident-history update failed: {error}")
+
+
+initialize_reports_database()
+
 # Default telemetry (used before any prediction is made)
 default_telemetry = {
     "Traffic_Volume_Bytes": 500000000,
@@ -143,6 +280,8 @@ latest_state = {
     "telemetry": dict(default_telemetry),
     "updated_at": time.time(),
 }
+latest_prediction_history_id: int | None = None
+active_incident_history_id: int | None = None
 
 initial_incident_time = time.time()
 incident_state = {
@@ -560,7 +699,7 @@ def build_ai_analysis() -> dict:
 
 
 def sync_incident_with_latest_prediction() -> None:
-    global incident_state
+    global active_incident_history_id, incident_state
     level = normalize_level(latest_state["congestion_level"])
     prediction_key = f"{level}|{latest_state['confidence']}|{latest_state['updated_at']}"
 
@@ -595,6 +734,18 @@ def sync_incident_with_latest_prediction() -> None:
         "escalations": int(incident_state["escalations"]),
         "timeline": timeline,
     }
+    # The existing Alerts flow exposes Medium and High predictions as active
+    # alerts.  Low predictions remain stable telemetry and are not incidents.
+    incident_state["history_id"] = None
+    if level in ("High", "Medium"):
+        active_incident_history_id = save_incident_history(
+            latest_prediction_history_id,
+            now,
+            level,
+            latest_state["confidence"],
+            status,
+        )
+        incident_state["history_id"] = active_incident_history_id
 
 
 def build_alert_response() -> dict:
@@ -677,18 +828,18 @@ def dashboard():
     confidence = latest_state["confidence"]
     telemetry = latest_state["telemetry"]
 
-    base = build_dashboard_state(congestion_level, confidence)
+    metrics = compute_metrics(telemetry, congestion_level)
     return {
-        "network_health": base.network_health,
-        "current_congestion": base.current_congestion,
-        "confidence": base.confidence,
-        "prediction_next": base.prediction_next,
-        "connected_devices": base.connected_devices,
-        "status": base.status,
-        "topology_nodes": compute_topology(telemetry, congestion_level),
+        "current_congestion": normalize_level(congestion_level),
+        "confidence": confidence,
+        "active_users": telemetry["Active_Users"],
+        "topology_nodes": NETWORK_NODES,
         "edges": EDGES,
-        "traffic_data": compute_traffic_data(telemetry, congestion_level),
-        "metrics": compute_metrics(telemetry, congestion_level),
+        "metrics": {
+            "total_bandwidth": metrics["total_bandwidth"],
+            "avg_latency": metrics["avg_latency"],
+            "packet_loss": metrics["packet_loss"],
+        },
     }
 
 
@@ -745,7 +896,7 @@ def predict(data: NetworkInput):
     print("====================================\n")
 
     # Update global state with prediction + telemetry so the dashboard stays live
-    global latest_state
+    global latest_state, latest_prediction_history_id
     latest_state = {
         "congestion_level": congestion_level,
         "confidence": confidence,
@@ -754,6 +905,7 @@ def predict(data: NetworkInput):
     }
 
     record_prediction_success(inference_latency_ms, input_df, congestion_level)
+    latest_prediction_history_id = save_prediction_history(data, congestion_level, confidence, inference_latency_ms)
     sync_incident_with_latest_prediction()
     mlops_state["alert_dispatch_status"] = "Dispatched"
 
@@ -762,6 +914,60 @@ def predict(data: NetworkInput):
         "prediction": congestion_level,
         "confidence": confidence
     }
+
+
+@app.get("/reports")
+def reports():
+    """Return only persisted prediction telemetry and incident lifecycle records."""
+    unavailable = {
+        "summary": {
+            "total_events_30d": None,
+            "avg_resolution_minutes": None,
+            "prevented_outages": None,
+        },
+        "traffic_history": [],
+        "incident_history": [],
+    }
+    try:
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat()
+        with reports_connection() as connection:
+            total_events_30d = int(connection.execute(
+                """SELECT COUNT(*) FROM incident_history
+                   WHERE is_genuine_incident = 1 AND created_at_utc >= ?""", (cutoff,)
+            ).fetchone()[0])
+            average_resolution = connection.execute("""
+                SELECT AVG((julianday(resolved_at_utc) - julianday(created_at_utc)) * 1440.0)
+                FROM incident_history
+                WHERE is_genuine_incident = 1 AND resolved_at_utc IS NOT NULL
+            """).fetchone()[0]
+            traffic_history = [dict(row) for row in connection.execute("""
+                SELECT created_at_utc, bandwidth_utilization_percent, predicted_congestion_level
+                FROM prediction_history
+                ORDER BY created_at_utc ASC, id ASC
+            """)]
+            incident_rows = connection.execute("""
+                SELECT id, created_at_utc, resolved_at_utc, congestion_level,
+                       confidence_percent, status, escalation_count,
+                       CASE WHEN resolved_at_utc IS NULL THEN NULL
+                            ELSE (julianday(resolved_at_utc) - julianday(created_at_utc)) * 1440.0
+                       END AS duration_minutes
+                FROM incident_history
+                WHERE is_genuine_incident = 1
+                ORDER BY created_at_utc DESC, id DESC
+            """)
+            incident_history = [dict(row) for row in incident_rows]
+        return {
+            "summary": {
+                "total_events_30d": total_events_30d,
+                "avg_resolution_minutes": round(float(average_resolution), 1) if average_resolution is not None else None,
+                "prevented_outages": None,
+            },
+            "traffic_history": traffic_history,
+            "incident_history": incident_history,
+        }
+    except sqlite3.Error as error:
+        print(f"Reports history retrieval failed: {error}")
+        return unavailable
 
 
 @app.get("/alerts")
@@ -789,6 +995,11 @@ def escalate_alert(_action: AlertAction):
         "description": "Alert escalated to Network Operations Center.",
         "color": "#fbbf24",
     })
+    update_incident_history(
+        incident_state.get("history_id"),
+        incident_state["status"],
+        incident_state["escalations"],
+    )
 
     return {
         "escalated": True,
@@ -799,6 +1010,7 @@ def escalate_alert(_action: AlertAction):
 
 @app.post("/alerts/resolve")
 def resolve_alert(_action: AlertAction):
+    global active_incident_history_id
     sync_incident_with_latest_prediction()
     level = normalize_level(latest_state["congestion_level"])
 
@@ -823,6 +1035,13 @@ def resolve_alert(_action: AlertAction):
             "description": "Incident resolved after backend confirmed Low congestion.",
             "color": "#34d399",
         })
+        update_incident_history(
+            active_incident_history_id,
+            incident_state["status"],
+            incident_state["escalations"],
+            now,
+        )
+        active_incident_history_id = None
 
     return {
         "resolved": True,
@@ -838,42 +1057,109 @@ def ai_analysis():
 
 @app.get("/analytics")
 def analytics():
-    dataset = pd.read_csv(DATASET_PATH)
-    features = dataset[FEATURE_COLUMNS]
-    labels = dataset[TARGET_COLUMN]
-    encoded_labels = encoder.transform(labels)
+    """Return the latest completed Random Forest evaluation recorded in MLflow.
 
-    predictions = model.predict(features)
-    accuracy = round(float(accuracy_score(encoded_labels, predictions)) * 100, 2)
-    precision = round(float(precision_score(encoded_labels, predictions, average="weighted", zero_division=0)) * 100, 2)
-    recall = round(float(recall_score(encoded_labels, predictions, average="weighted", zero_division=0)) * 100, 2)
-    f1 = round(float(f1_score(encoded_labels, predictions, average="weighted", zero_division=0)) * 100, 2)
-
-    class_labels = encoder.inverse_transform(np.arange(len(encoder.classes_))).tolist()
-    cm = confusion_matrix(encoded_labels, predictions, labels=np.arange(len(encoder.classes_)))
-
-    confusion_rows = []
-    for idx, label in enumerate(class_labels):
-        confusion_rows.append({
-            "label": label,
-            "value": int(cm[idx, idx]),
-            "color": ["#34d399", "#38bdf8", "#a78bfa"][idx % 3],
-            "desc": f"Correct predictions for {label}",
-        })
-
-    return {
-        "model_name": "Random Forest",
-        "accuracy": accuracy,
-        "precision": precision,
-        "recall": recall,
-        "f1_score": f1,
-        "classes": class_labels,
-        "confusion_matrix": confusion_rows,
-        "radar_metrics": [
-            {"metric": "Accuracy", "value": accuracy},
-            {"metric": "Precision", "value": precision},
-            {"metric": "Recall", "value": recall},
-            {"metric": "F1", "value": f1},
-            {"metric": "Stability", "value": round(min(100, accuracy + 1.2), 2)},
-        ],
+    This endpoint deliberately reads MLflow's stored evaluation instead of
+    recalculating metrics against the application's full CSV dataset.
+    """
+    unavailable = {
+        "available": False,
+        "message": "MLflow evaluation unavailable",
+        "model_name": None,
+        "registered_model_name": None,
+        "model_version": None,
+        "run_id": None,
+        "evaluation_timestamp_utc": None,
+        "accuracy": None,
+        "precision": None,
+        "recall": None,
+        "f1_score": None,
+        "n_estimators": None,
+        "random_state": None,
+        "training_time": None,
+        "confusion_matrix": None,
+        "stability": None,
+        "best_model": None,
+        "comparison_models": [],
     }
+    mlflow_db_path = PROJECT_ROOT / "mlflow.db"
+
+    try:
+        with sqlite3.connect(f"file:{mlflow_db_path.as_posix()}?mode=ro", uri=True) as connection:
+            connection.row_factory = sqlite3.Row
+            experiment_rows = connection.execute("""
+                SELECT experiment_id
+                FROM experiments
+                WHERE name = ? AND lifecycle_stage = 'active'
+            """, ("Network Congestion Prediction",)).fetchall()
+
+            for experiment in experiment_rows:
+                candidate_runs = connection.execute("""
+                    SELECT run_uuid, start_time, end_time
+                    FROM runs
+                    WHERE experiment_id = ? AND status = 'FINISHED' AND lifecycle_stage = 'active'
+                    ORDER BY end_time DESC, start_time DESC
+                """, (experiment["experiment_id"],)).fetchall()
+
+                for run in candidate_runs:
+                    logged_model = connection.execute("""
+                        SELECT name
+                        FROM logged_models
+                        WHERE source_run_id = ? AND lifecycle_stage = 'active'
+                        ORDER BY creation_timestamp_ms DESC
+                        LIMIT 1
+                    """, (run["run_uuid"],)).fetchone()
+                    registered_model = connection.execute("""
+                        SELECT name, version
+                        FROM model_versions
+                        WHERE run_id = ? AND status = 'READY'
+                        ORDER BY creation_time DESC
+                        LIMIT 1
+                    """, (run["run_uuid"],)).fetchone()
+                    model_identifiers = " ".join(filter(None, [
+                        logged_model["name"] if logged_model else None,
+                        registered_model["name"] if registered_model else None,
+                    ])).lower()
+                    if not any(identifier in model_identifiers for identifier in ("randomforest", "random forest", "random_forest")):
+                        continue
+
+                    metrics = {
+                        row["key"]: float(row["value"])
+                        for row in connection.execute("""
+                            SELECT key, value FROM latest_metrics WHERE run_uuid = ?
+                        """, (run["run_uuid"],))
+                    }
+                    required_metrics = ("accuracy", "precision", "recall", "f1_score")
+                    if not all(metric in metrics for metric in required_metrics):
+                        continue
+
+                    params = {
+                        row["key"]: row["value"]
+                        for row in connection.execute("SELECT key, value FROM params WHERE run_uuid = ?", (run["run_uuid"],))
+                    }
+                    timestamp = datetime.fromtimestamp(run["end_time"] / 1000, timezone.utc).isoformat() if run["end_time"] else None
+                    return {
+                        "available": True,
+                        "message": None,
+                        "model_name": logged_model["name"] if logged_model else "Random Forest",
+                        "registered_model_name": registered_model["name"] if registered_model else None,
+                        "model_version": registered_model["version"] if registered_model else None,
+                        "run_id": run["run_uuid"],
+                        "evaluation_timestamp_utc": timestamp,
+                        "accuracy": metrics["accuracy"] * 100,
+                        "precision": metrics["precision"] * 100,
+                        "recall": metrics["recall"] * 100,
+                        "f1_score": metrics["f1_score"] * 100,
+                        "n_estimators": params.get("n_estimators"),
+                        "random_state": params.get("random_state"),
+                        # These values are not present in the selected run.
+                        "training_time": None,
+                        "confusion_matrix": None,
+                        "stability": None,
+                        "best_model": None,
+                        "comparison_models": [],
+                    }
+    except (OSError, sqlite3.Error, ValueError) as error:
+        print(f"MLflow analytics retrieval failed: {error}")
+
+    return unavailable
