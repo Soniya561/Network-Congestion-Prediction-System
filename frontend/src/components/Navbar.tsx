@@ -3,6 +3,7 @@ import type { Page } from "../App";
 interface NavbarProps {
   currentPage: Page;
   onNavigate: (page: Page) => void;
+  onLogout: () => void;
 }
 
 const navItems: { id: Page; label: string }[] = [
@@ -15,7 +16,7 @@ const navItems: { id: Page; label: string }[] = [
   { id: "profile", label: "Reports" },
 ];
 
-export default function Navbar({ currentPage, onNavigate }: NavbarProps) {
+export default function Navbar({ currentPage, onNavigate, onLogout }: NavbarProps) {
   return (
     <nav
       className="fixed top-0 left-0 right-0 z-50 glass-strong"
@@ -85,6 +86,14 @@ export default function Navbar({ currentPage, onNavigate }: NavbarProps) {
           >
             AD
           </div>
+          <button
+            type="button"
+            onClick={onLogout}
+            className="font-mono text-xs"
+            style={{ color: "#94a3b8" }}
+          >
+            LOGOUT
+          </button>
         </div>
       </div>
     </nav>

@@ -1,0 +1,5 @@
+.env
+backend/.env
+frontend/.env
+backend/auth.db
+backend/auth.db-*

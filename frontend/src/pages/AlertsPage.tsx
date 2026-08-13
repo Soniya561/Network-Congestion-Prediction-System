@@ -91,7 +91,11 @@ export default function AlertsPage() {
   const [summary, setSummary] = useState<IncidentSummary>({ active_alerts: 0, under_investigation: 0, resolved_today: 0, mttr: null, ai_accuracy: 0, escalation_count: 0 });
   const [network, setNetwork] = useState<AlertNetwork | null>(null);
   const [analysis, setAnalysis] = useState<AlertAnalysis | null>(null);
+  const [operatorEmail, setOperatorEmail] = useState<string | null>(null);
   const [operatorMessage, setOperatorMessage] = useState<string | null>(null);
+  const [emailSending, setEmailSending] = useState(false);
+  const [emailSent, setEmailSent] = useState(false);
+  const [emailError, setEmailError] = useState<string | null>(null);
   const [analysisOpen, setAnalysisOpen] = useState(false);
   const requestInFlight = useRef(false);
 
@@ -109,6 +113,20 @@ export default function AlertsPage() {
 
   useEffect(() => {
     let isMounted = true;
+
+    const fetchSession = async () => {
+      try {
+        const response = await api.get<{ authenticated: boolean; email?: string | null }>("/auth/session");
+        if (isMounted) {
+          setOperatorEmail(response.data.authenticated ? response.data.email ?? null : null);
+        }
+      } catch (error) {
+        console.error("Unable to load operator session", error);
+        if (isMounted) {
+          setOperatorEmail(null);
+        }
+      }
+    };
 
     const fetchAlerts = async () => {
       if (requestInFlight.current) return;
@@ -129,6 +147,7 @@ export default function AlertsPage() {
       }
     };
 
+    fetchSession();
     fetchAlerts();
     const id = window.setInterval(fetchAlerts, 5000);
     return () => {
@@ -173,6 +192,52 @@ export default function AlertsPage() {
       console.error(fallbackMessage, error);
       setOperatorMessage(fallbackMessage);
     } finally {
+      requestInFlight.current = false;
+    }
+  };
+
+  const alertActionError = (error: unknown, fallbackMessage: string) => {
+    if (typeof error === "object" && error && "response" in error) {
+      const response = (error as { response?: { data?: { detail?: string; message?: string } } }).response;
+      return response?.data?.detail || response?.data?.message || fallbackMessage;
+    }
+    return fallbackMessage;
+  };
+
+  const sendAlertEmail = async (item: Alert) => {
+    if (!network || !analysis) return;
+
+    if (item.priority !== "HIGH") {
+      const message = "Email alerts are available for HIGH congestion only.";
+      setEmailError(message);
+      setOperatorMessage(message);
+      return;
+    }
+
+    requestInFlight.current = true;
+    setEmailSending(true);
+    setEmailSent(false);
+    setEmailError(null);
+    setOperatorMessage(null);
+
+    try {
+      const response = await api.post<{ success: boolean; message?: string; recipient?: string }>("/alerts/send-email", {
+        congestion_level: item.priority,
+        confidence: analysis.confidence,
+        network_health: analysis.network_health,
+        connected_devices: analysis.connected_devices,
+        alert_status: statusLabel[item.status].label,
+        timestamp: new Date(item.createdAt).toISOString(),
+      });
+      setEmailSent(true);
+      setOperatorMessage(response.data.message || "Email Sent");
+    } catch (error) {
+      const message = alertActionError(error, "Unable to send high congestion alert email.");
+      console.error(message, error);
+      setEmailError(message);
+      setOperatorMessage(message);
+    } finally {
+      setEmailSending(false);
       requestInFlight.current = false;
     }
   };
@@ -227,6 +292,9 @@ export default function AlertsPage() {
             const cfg = priorityConfig[item.priority];
             const isExpanded = expandedId === item.id;
             const isResolved = item.status === "resolved";
+            const canSendEmail = item.priority === "HIGH" && !isResolved;
+            const emailDisabled = !canSendEmail || emailSending;
+            const emailButtonLabel = !canSendEmail ? "Send Email" : emailSending ? "Sending..." : emailSent ? "Email Sent" : "Send Email";
             return (
               <div
                 key={item.id}
@@ -323,19 +391,32 @@ export default function AlertsPage() {
                         Resolve
                       </button>
                       <button
-                        onClick={() => postAlertAction("/alerts/escalate", "Unable to contact backend for escalation.")}
-                        disabled={isResolved}
+                        onClick={(event) => {
+                          event.stopPropagation();
+                          sendAlertEmail(item);
+                        }}
+                        disabled={emailDisabled}
                         className="px-4 py-2 rounded-lg text-xs font-mono transition-all"
                         style={{
                           background: "rgba(251,191,36,0.1)",
                           border: "1px solid rgba(251,191,36,0.3)",
                           color: "#fbbf24",
-                          opacity: isResolved ? 0.5 : 1,
+                          opacity: emailDisabled ? 0.5 : 1,
                         }}
                       >
-                        Escalate
+                        {emailButtonLabel}
                       </button>
                     </div>
+                    {item.priority !== "HIGH" && (
+                      <div className="mt-3 text-xs" style={{ color: "#94a3b8" }}>
+                        Email alerts are available for HIGH congestion only.
+                      </div>
+                    )}
+                    {emailError && (
+                      <div className="mt-3 text-xs" style={{ color: "#f87171" }}>
+                        {emailError}
+                      </div>
+                    )}
                   </div>
                 )}
               </div>

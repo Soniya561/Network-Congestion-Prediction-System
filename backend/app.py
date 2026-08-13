@@ -1,21 +1,32 @@
+import os
+import hmac
 import random
 import sqlite3
 import time
+import secrets
+import smtplib
 from datetime import datetime, timedelta, timezone
+from email.message import EmailMessage
 from pathlib import Path
+from threading import Lock
 
 import joblib
 import numpy as np
 import pandas as pd
-from fastapi import FastAPI, HTTPException
+from dotenv import load_dotenv
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
+from pydantic import EmailStr, Field
 from scipy.stats import ks_2samp
 from sklearn.metrics import accuracy_score, confusion_matrix, f1_score, precision_score, recall_score
 
 BACKEND_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = BACKEND_DIR.parent
 REPORTS_DB_PATH = BACKEND_DIR / "reports_history.db"
+
+load_dotenv(BACKEND_DIR / ".env")
 
 # Create FastAPI app
 app = FastAPI(
@@ -24,6 +35,249 @@ app = FastAPI(
     version="1.0"
 )
 
+OTP_TTL_SECONDS = 5 * 60
+OTP_MAX_ATTEMPTS = 5
+OTP_STORE_LOCK = Lock()
+OTP_STORE: dict[str, dict[str, object]] = {}
+SESSION_COOKIE_NAME = "netsense_operator_session"
+SESSION_STORE_LOCK = Lock()
+SESSION_STORE: dict[str, dict[str, object]] = {}
+
+
+def normalized_email(email: str) -> str:
+    return email.strip().lower()
+
+
+def current_epoch() -> int:
+    return int(time.time())
+
+
+def otp_hash(otp: str, salt: str) -> str:
+    import hashlib
+
+    return hashlib.pbkdf2_hmac("sha256", otp.encode("utf-8"), salt.encode("utf-8"), 200_000).hex()
+
+
+def send_otp_email(recipient_email: str, otp: str) -> None:
+    smtp_host = os.getenv("SMTP_HOST", "").strip()
+    smtp_port_raw = os.getenv("SMTP_PORT", "").strip()
+    smtp_username = os.getenv("SMTP_USERNAME", "").strip()
+    smtp_password = os.getenv("SMTP_PASSWORD", "")
+    smtp_from_email = os.getenv("SMTP_FROM_EMAIL", "").strip()
+    smtp_from_name = os.getenv("SMTP_FROM_NAME", "NETSENSE AI").strip() or "NETSENSE AI"
+    smtp_use_tls = os.getenv("SMTP_USE_TLS", "true").strip().lower() == "true"
+
+    if not smtp_host or not smtp_port_raw or not smtp_from_email:
+        raise RuntimeError("SMTP configuration is incomplete.")
+
+    smtp_port = int(smtp_port_raw)
+
+    message = EmailMessage()
+    message["From"] = f"{smtp_from_name} <{smtp_from_email}>"
+    message["To"] = recipient_email
+    message["Subject"] = "NETSENSE AI - Your Verification Code"
+    message.set_content(
+        "NETSENSE AI\n\n"
+        "Your verification code is:\n\n"
+        f"{otp}\n\n"
+        "This code will expire in 5 minutes.\n\n"
+        "If you did not request this code, you can ignore this email.\n"
+    )
+
+    with smtplib.SMTP(smtp_host, smtp_port, timeout=20) as client:
+        client.ehlo()
+        if smtp_use_tls:
+            client.starttls()
+            client.ehlo()
+        if smtp_username and smtp_password:
+            client.login(smtp_username, smtp_password)
+        client.send_message(message)
+
+
+def create_operator_session(email: str) -> str:
+    normalized = normalized_email(email)
+    token = secrets.token_urlsafe(32)
+    with SESSION_STORE_LOCK:
+        SESSION_STORE[token] = {
+            "email": normalized,
+            "operator_email": normalized,
+            "created_at": current_epoch(),
+        }
+    return token
+
+
+def get_operator_session_from_request(request: Request) -> dict[str, object] | None:
+    token = request.cookies.get(SESSION_COOKIE_NAME)
+    if not token:
+        return None
+    with SESSION_STORE_LOCK:
+        session = SESSION_STORE.get(token)
+        if not session:
+            return None
+        return dict(session)
+
+
+def operator_email_from_session(session: dict[str, object] | None) -> str | None:
+    if not session:
+        return None
+    email = session.get("operator_email") or session.get("email")
+    if not email:
+        return None
+    return normalized_email(str(email))
+
+
+def get_operator_email_from_request(request: Request) -> str | None:
+    return operator_email_from_session(get_operator_session_from_request(request))
+
+
+def invalidate_operator_session(token: str | None) -> None:
+    if not token:
+        return
+    with SESSION_STORE_LOCK:
+        SESSION_STORE.pop(token, None)
+
+
+class OtpRequest(BaseModel):
+    email: EmailStr
+
+
+class OtpVerify(BaseModel):
+    email: EmailStr
+    otp: str = Field(min_length=6, max_length=6, pattern=r"^\d{6}$")
+
+
+class AlertEmailRequest(BaseModel):
+    congestion_level: str
+    confidence: float
+    network_health: int
+    connected_devices: int
+    timestamp: str | None = None
+    alert_status: str = "INVESTIGATING"
+
+
+def store_otp(email: str, otp: str) -> None:
+    salt = secrets.token_hex(16)
+    now = current_epoch()
+    with OTP_STORE_LOCK:
+        OTP_STORE[email] = {
+            "email": email,
+            "otp_hash": otp_hash(otp, salt),
+            "salt": salt,
+            "created_at": now,
+            "expires_at": now + OTP_TTL_SECONDS,
+            "attempts_left": OTP_MAX_ATTEMPTS,
+        }
+
+
+def get_otp_record(email: str) -> dict[str, object] | None:
+    with OTP_STORE_LOCK:
+        record = OTP_STORE.get(email)
+        if not record:
+            return None
+        if int(record["expires_at"]) <= current_epoch():
+            OTP_STORE.pop(email, None)
+            return None
+        return dict(record)
+
+
+def invalidate_otp(email: str) -> None:
+    with OTP_STORE_LOCK:
+        OTP_STORE.pop(email, None)
+
+
+def issue_otp(email: str) -> None:
+    otp = f"{secrets.randbelow(1_000_000):06d}"
+    store_otp(email, otp)
+    try:
+        send_otp_email(email, otp)
+    except Exception as error:
+        invalidate_otp(email)
+        raise HTTPException(status_code=500, detail="Unable to send OTP via SMTP") from error
+
+
+def otp_success(message: str) -> JSONResponse:
+    return JSONResponse(status_code=200, content={"success": True, "message": message})
+
+
+def otp_error(status_code: int, message: str) -> JSONResponse:
+    return JSONResponse(status_code=status_code, content={"success": False, "message": message})
+
+
+@app.post("/auth/request-otp")
+def request_otp(payload: OtpRequest):
+    email = normalized_email(str(payload.email))
+    try:
+        issue_otp(email)
+    except HTTPException as error:
+        return otp_error(error.status_code, "Unable to send OTP via SMTP")
+    return otp_success("OTP sent successfully")
+
+
+@app.post("/auth/verify-otp")
+def verify_otp(payload: OtpVerify):
+    email = normalized_email(str(payload.email))
+    record = get_otp_record(email)
+    if record is None:
+        return otp_error(400, "OTP expired")
+
+    attempts_left = int(record["attempts_left"])
+    if attempts_left <= 0:
+        invalidate_otp(email)
+        return otp_error(400, "OTP expired")
+
+    supplied_hash = otp_hash(payload.otp, str(record["salt"]))
+    expected_hash = str(record["otp_hash"])
+    if not hmac.compare_digest(expected_hash, supplied_hash):
+        attempts_left -= 1
+        with OTP_STORE_LOCK:
+            current_record = OTP_STORE.get(email)
+            if current_record is not None and int(current_record["expires_at"]) > current_epoch():
+                current_record["attempts_left"] = attempts_left
+                if attempts_left <= 0:
+                    OTP_STORE.pop(email, None)
+        if attempts_left <= 0:
+            return otp_error(400, "Invalid OTP")
+        return otp_error(400, "Invalid OTP")
+
+    invalidate_otp(email)
+    print("DEBUG AUTH SESSION EMAIL:", email)
+    response = otp_success("OTP verified")
+    response.set_cookie(
+        key=SESSION_COOKIE_NAME,
+        value=create_operator_session(email),
+        httponly=True,
+        secure=False,
+        samesite="lax",
+        max_age=24 * 60 * 60,
+    )
+    return response
+
+
+@app.post("/auth/resend-otp")
+def resend_otp(payload: OtpRequest):
+    email = normalized_email(str(payload.email))
+    invalidate_otp(email)
+    try:
+        issue_otp(email)
+    except HTTPException as error:
+        return otp_error(error.status_code, "Unable to send OTP via SMTP")
+    return otp_success("OTP sent successfully")
+
+
+@app.get("/auth/session")
+def auth_session(request: Request):
+    session = get_operator_session_from_request(request)
+    print("DEBUG SESSION:", session)
+    email = operator_email_from_session(session)
+    return {"authenticated": email is not None, "email": email}
+
+
+@app.post("/auth/logout")
+def auth_logout(request: Request):
+    invalidate_operator_session(request.cookies.get(SESSION_COOKIE_NAME))
+    response = JSONResponse(status_code=200, content={"success": True})
+    response.delete_cookie(SESSION_COOKIE_NAME)
+    return response
 
 @app.get("/mlops")
 def mlops():
@@ -436,8 +690,10 @@ def compute_metrics(telemetry: dict, congestion_level: str) -> dict:
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
-        "http://localhost:5173",
-        "http://localhost:8443",
+        os.getenv("ALLOWED_ORIGIN_1", "http://localhost:5173"),
+        os.getenv("ALLOWED_ORIGIN_2", "http://localhost:8443"),
+        "http://127.0.0.1:5173",
+        "http://127.0.0.1:8443",
     ],
     allow_credentials=True,
     allow_methods=["*"],
@@ -644,6 +900,70 @@ def recommendation_for(level: str) -> list[str]:
         "Continue passive monitoring for the next prediction interval",
         "Close the incident only after the backend confirms low risk",
     ]
+
+
+def smtp_settings() -> dict[str, object]:
+    smtp_host = os.getenv("SMTP_HOST", "").strip()
+    smtp_port_raw = os.getenv("SMTP_PORT", "").strip()
+    smtp_username = os.getenv("SMTP_USERNAME", "").strip()
+    smtp_password = os.getenv("SMTP_PASSWORD", "")
+    smtp_from_email = os.getenv("SMTP_FROM_EMAIL", "").strip()
+    smtp_from_name = os.getenv("SMTP_FROM_NAME", "NETSENSE AI").strip() or "NETSENSE AI"
+    smtp_use_tls = os.getenv("SMTP_USE_TLS", "true").strip().lower() in ("1", "true", "yes", "on")
+
+    if not all([smtp_host, smtp_port_raw, smtp_username, smtp_password, smtp_from_email]):
+        raise RuntimeError("SMTP configuration is incomplete.")
+
+    try:
+        smtp_port = int(smtp_port_raw)
+    except ValueError as error:
+        raise RuntimeError("SMTP port is invalid.") from error
+
+    return {
+        "host": smtp_host,
+        "port": smtp_port,
+        "username": smtp_username,
+        "password": smtp_password,
+        "from_email": smtp_from_email,
+        "from_name": smtp_from_name,
+        "use_tls": smtp_use_tls,
+    }
+
+
+def send_high_congestion_alert_email(payload: AlertEmailRequest, recipient: str) -> None:
+    settings = smtp_settings()
+    timestamp = payload.timestamp or utc_timestamp()
+    connected_devices = f"{payload.connected_devices:,}"
+    confidence = f"{payload.confidence:.2f}"
+    recommendations = recommendation_for("High")
+
+    message = EmailMessage()
+    message["From"] = f"{settings['from_name']} <{settings['from_email']}>"
+    message["To"] = recipient
+    message["Subject"] = "NETSENSE AI - HIGH CONGESTION ALERT"
+    message.set_content(
+        "NETSENSE AI\n"
+        "HIGH CONGESTION ALERT\n\n"
+        "Congestion Level: HIGH\n"
+        "Model: Random Forest\n"
+        f"Model Confidence: {confidence}%\n"
+        f"Network Health: {payload.network_health}%\n"
+        f"Connected Devices: {connected_devices}\n"
+        f"Status: {payload.alert_status.upper()}\n"
+        f"Prediction Time: {timestamp}\n\n"
+        "AI Recommendations:\n"
+        f"- {recommendations[0]}\n"
+        f"- {recommendations[1]}\n"
+        f"- {recommendations[2]}\n"
+    )
+
+    with smtplib.SMTP(str(settings["host"]), int(settings["port"]), timeout=20) as client:
+        client.ehlo()
+        if bool(settings["use_tls"]):
+            client.starttls()
+            client.ehlo()
+        client.login(str(settings["username"]), str(settings["password"]))
+        client.send_message(message)
 
 
 def build_ai_analysis() -> dict:
@@ -973,6 +1293,32 @@ def reports():
 @app.get("/alerts")
 def alerts():
     return build_alert_response()
+
+
+@app.post("/alerts/send-email")
+def send_alert_email(payload: AlertEmailRequest, request: Request):
+    session = get_operator_session_from_request(request)
+    print("DEBUG ALERT SESSION:", session)
+    if session is None:
+        raise HTTPException(status_code=401, detail="Operator session is required.")
+
+    session_email = operator_email_from_session(session)
+    if session_email is None:
+        raise HTTPException(status_code=401, detail="Operator session email is unavailable.")
+
+    if normalize_level(payload.congestion_level) != "High":
+        raise HTTPException(status_code=400, detail="Email alerts are available for HIGH congestion only.")
+
+    try:
+        send_high_congestion_alert_email(payload, session_email)
+    except Exception as error:
+        raise HTTPException(status_code=500, detail="Unable to send alert email. Check SMTP configuration.") from error
+
+    return {
+        "success": True,
+        "message": "High congestion alert email sent successfully.",
+        "recipient": session_email,
+    }
 
 
 @app.post("/alerts/escalate")
