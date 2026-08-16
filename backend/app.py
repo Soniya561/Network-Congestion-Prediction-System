@@ -59,6 +59,51 @@ def otp_hash(otp: str, salt: str) -> str:
 
 
 def send_otp_email(recipient_email: str, otp: str) -> None:
+    sendgrid_api_key = os.getenv("SENDGRID_API_KEY", "").strip()
+    if sendgrid_api_key:
+        import json
+        import urllib.error
+        import urllib.request
+
+        sendgrid_from_email = os.getenv("SENDGRID_FROM_EMAIL", "").strip()
+        sendgrid_from_name = os.getenv("SENDGRID_FROM_NAME", "NETSENSE AI").strip() or "NETSENSE AI"
+        if not sendgrid_from_email:
+            raise RuntimeError("SendGrid configuration is incomplete.")
+
+        payload = {
+            "personalizations": [{"to": [{"email": recipient_email}]}],
+            "from": {"email": sendgrid_from_email, "name": sendgrid_from_name},
+            "subject": "NETSENSE AI - Your Verification Code",
+            "content": [
+                {
+                    "type": "text/plain",
+                    "value": (
+                        "NETSENSE AI\n\n"
+                        "Your verification code is:\n\n"
+                        f"{otp}\n\n"
+                        "This code will expire in 5 minutes.\n\n"
+                        "If you did not request this code, you can ignore this email.\n"
+                    ),
+                }
+            ],
+        }
+        request = urllib.request.Request(
+            "https://api.sendgrid.com/v3/mail/send",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={
+                "Authorization": f"Bearer {sendgrid_api_key}",
+                "Content-Type": "application/json",
+            },
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=20) as response:
+                if response.status < 200 or response.status >= 300:
+                    raise RuntimeError(f"SendGrid request failed with status {response.status}.")
+        except urllib.error.HTTPError as error:
+            raise RuntimeError(f"SendGrid request failed with status {error.code}.") from error
+        return
+
     smtp_host = os.getenv("SMTP_HOST", "").strip()
     smtp_port_raw = os.getenv("SMTP_PORT", "").strip()
     smtp_username = os.getenv("SMTP_USERNAME", "").strip()
