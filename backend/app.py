@@ -191,6 +191,7 @@ def issue_otp(email: str) -> None:
     try:
         send_otp_email(email, otp)
     except Exception as error:
+        print(f"SMTP OTP ERROR: {type(error).__name__}: {error}", flush=True)
         invalidate_otp(email)
         raise HTTPException(status_code=500, detail="Unable to send OTP via SMTP") from error
 
